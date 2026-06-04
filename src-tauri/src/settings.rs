@@ -106,6 +106,18 @@ pub struct PostProcessProvider {
     pub supports_structured_output: bool,
 }
 
+/// A Handy 2.0 hotword route: spoken prefix → Ollama model + prompt addendum.
+#[derive(Serialize, Deserialize, Debug, Clone, Type, PartialEq)]
+pub struct Route {
+    pub id: String,
+    /// Spoken hotword prefix; `None` = default route.
+    pub trigger: Option<String>,
+    /// Ollama model ID for this route.
+    pub ollama_model: String,
+    /// Appended to the base system prompt when this route fires.
+    pub prompt_addendum: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum OverlayPosition {
@@ -401,6 +413,13 @@ pub struct AppSettings {
     pub post_process_prompts: Vec<LLMPrompt>,
     #[serde(default)]
     pub post_process_selected_prompt_id: Option<String>,
+    // --- Handy 2.0 additions ---
+    #[serde(default)]
+    pub h2_enabled: bool,
+    #[serde(default)]
+    pub h2_memory_file_path: Option<String>,
+    #[serde(default = "default_h2_routes")]
+    pub h2_routes: Vec<Route>,
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
@@ -521,8 +540,49 @@ fn default_post_process_provider_id() -> String {
     "openai".to_string()
 }
 
+/// Handy 2.0 default hotword routes (ported from v1). Re-verify model IDs at
+/// build time (Ollama Cloud catalog).
+pub fn default_h2_routes() -> Vec<Route> {
+    vec![
+        Route {
+            id: "polish".to_string(),
+            trigger: Some("Polish command".to_string()),
+            ollama_model: "kimi-k2.6".to_string(),
+            prompt_addendum: Some(
+                "Rewrite the following dictation into a highly professional, structured email \
+                 or document suitable for corporate communications."
+                    .to_string(),
+            ),
+        },
+        Route {
+            id: "prompt_engineering".to_string(),
+            trigger: Some("Prompt engineering command".to_string()),
+            ollama_model: "qwen3-coder-next".to_string(),
+            prompt_addendum: Some(
+                "Format this as a highly detailed, structured prompt for an AI coding agent \
+                 like Claude or Cursor."
+                    .to_string(),
+            ),
+        },
+        Route {
+            id: "standard".to_string(),
+            trigger: None,
+            ollama_model: "gemini-3-flash-preview".to_string(),
+            prompt_addendum: None,
+        },
+    ]
+}
+
 fn default_post_process_providers() -> Vec<PostProcessProvider> {
     let mut providers = vec![
+        PostProcessProvider {
+            id: "ollama".to_string(),
+            label: "Ollama Cloud".to_string(),
+            base_url: "https://ollama.com/v1".to_string(),
+            allow_base_url_edit: true,
+            models_endpoint: Some("/models".to_string()),
+            supports_structured_output: false,
+        },
         PostProcessProvider {
             id: "openai".to_string(),
             label: "OpenAI".to_string(),
@@ -799,6 +859,9 @@ pub fn get_default_settings() -> AppSettings {
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
+        h2_enabled: false,
+        h2_memory_file_path: None,
+        h2_routes: default_h2_routes(),
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),

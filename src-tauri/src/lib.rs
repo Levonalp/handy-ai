@@ -6,6 +6,7 @@ pub mod audio_toolkit;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod handy2;
 mod helpers;
 mod input;
 mod llm_client;
@@ -425,6 +426,13 @@ pub fn run(cli_args: CliArgs) {
             commands::history::retry_history_entry_transcription,
             commands::history::update_history_limit,
             commands::history::update_recording_retention_period,
+            commands::handy2::set_ollama_key,
+            commands::handy2::has_ollama_key,
+            commands::handy2::delete_ollama_key,
+            commands::handy2::set_h2_enabled,
+            commands::handy2::set_h2_memory_path,
+            commands::handy2::set_h2_routes,
+            commands::handy2::test_ollama_connection,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![managers::history::HistoryUpdatePayload,]);
