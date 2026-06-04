@@ -1,0 +1,20 @@
+name: "Handy2 Unsigned Windows Build"
+
+# Builds the handy2 fork (hotword routing + live memory) for Windows x64 WITHOUT
+# code signing, and uploads the installer as an artifact. Manual trigger only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-unsigned:
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: windows-latest
+      target: x86_64-pc-windows-msvc
+      ref: handy2
+      upload-artifacts: true
+      sign-binaries: false
+    secrets: inherit
