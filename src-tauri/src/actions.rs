@@ -361,7 +361,14 @@ pub(crate) async fn process_transcription_output(
     }
 
     if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
+        // Handy 2.0: when enabled, route through our hotword + memory pipeline;
+        // otherwise use Handy's stock post-processing unchanged.
+        let processed = if settings.h2_enabled {
+            crate::handy2::post_process(&settings, &final_text).await
+        } else {
+            post_process_transcription(&settings, &final_text).await
+        };
+        if let Some(processed_text) = processed {
             post_processed_text = Some(processed_text.clone());
             final_text = processed_text;
 

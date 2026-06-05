@@ -28,6 +28,12 @@ pub fn delete_ollama_key() -> Result<(), String> {
 pub fn set_h2_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
     let mut s = get_settings(&app);
     s.h2_enabled = enabled;
+    // Handy 2.0 rides Handy's post-process pathway; enabling it must also turn on
+    // post-processing so the "transcribe with post-process" (Ctrl+Shift+Space)
+    // shortcut actually registers.
+    if enabled {
+        s.post_process_enabled = true;
+    }
     write_settings(&app, s);
     Ok(())
 }
