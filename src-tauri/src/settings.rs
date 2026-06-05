@@ -567,7 +567,7 @@ pub fn default_h2_routes() -> Vec<Route> {
         Route {
             id: "standard".to_string(),
             trigger: None,
-            ollama_model: "gemini-3-flash-preview".to_string(),
+            ollama_model: "deepseek-v4-flash".to_string(),
             prompt_addendum: None,
         },
     ]

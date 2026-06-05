@@ -22,8 +22,7 @@ fn write_rich_clipboard(text: &str) -> Result<(), String> {
     let mut html = String::new();
     pulldown_cmark::html::push_html(&mut html, pulldown_cmark::Parser::new(text));
     let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    cb.set()
-        .html(html, Some(text))
+    cb.set_html(html, Some(text.to_string()))
         .map_err(|e| e.to_string())
 }
 
