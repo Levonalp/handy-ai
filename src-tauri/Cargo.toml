@@ -59,6 +59,10 @@ env_filter = "0.1.0"
 tokio = "1.43.0"
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 enigo = "0.6.1"
+# Handy 2.0: rich-text (HTML) clipboard so formatted lists render as real bullets
+# in Outlook/Word/Teams while plain fields still get the literal Markdown text.
+arboard = "3"
+pulldown-cmark = "0.12"
 rodio = { git = "https://github.com/cjpais/rodio.git" }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
