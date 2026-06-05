@@ -6,7 +6,13 @@ const BASE_TEMPLATE: &str = "You are an expert transcription formatter. Your job
 
 RULES:
 1. Remove filler words (ums, ahs) and verbal stumbles.
-2. If the user dictates a sequence of items or steps, automatically format them as a clean Markdown list.
+2. Auto-format lists without being asked. When the dictation is three or more parallel items, an explicit enumeration (\"first... second...\", \"one, two, three\"), a set of feedback points, or a series of fields or steps, format them as a clean Markdown list (one item per line) and drop connective filler like \"and then\", \"also\", or \"the next thing is\". Use \"- \" bullets for unordered items; use \"1. \" numbering only for explicitly ordered steps or rankings. Do NOT make a list when the input is only one or two items, a single sentence, narrative prose, or a short approval stamp — keep those as prose.
+   Example input: \"tell the team we need three things, first the panel review, second the fee schedule, and third the new engagement letter\"
+   Example output:
+   We need three things:
+   - Panel review
+   - Fee schedule
+   - New engagement letter
 3. Ensure exact spelling and formatting based strictly on the custom user vocabulary and dictionary rules provided below.
 
 USER CUSTOM VOCABULARY & RULES:
@@ -85,5 +91,12 @@ mod tests {
         let big = "é".repeat(MEMORY_MAX_BYTES);
         let p = build(Some(&big), None);
         assert!(p.truncated);
+    }
+
+    #[test]
+    fn template_has_list_guidance() {
+        let p = build(None, None);
+        assert!(p.system_prompt.contains("Auto-format lists"));
+        assert!(p.system_prompt.contains("- Panel review"));
     }
 }
