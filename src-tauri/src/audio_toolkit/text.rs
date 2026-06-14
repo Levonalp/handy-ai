@@ -319,6 +319,238 @@ pub fn filter_transcription_output(
     filtered.trim().to_string()
 }
 
+// ───────────────────────────── number normalization ─────────────────────────
+//
+// Inverse text normalization (ITN): turn spoken number words into digits, e.g.
+// "twenty three" -> "23", "ten percent" -> "10%", "five dollars" -> "$5",
+// "two point five" -> "2.5". Pure and deterministic — runs inline on the
+// transcription path so it adds no latency and needs no network/LLM. English
+// only (gated by the caller). Non-number words pass through untouched, and a
+// number is never merged across attached punctuation ("twenty, three" -> "20, 3").
+
+#[derive(Clone, Copy)]
+enum NumTok {
+    Small(u64),  // 0-90 building blocks (units, teens, tens)
+    Hundred,     // multiplier
+    Scale(u128), // thousand / million / billion
+}
+
+fn number_word_value(w: &str) -> Option<u64> {
+    Some(match w {
+        "zero" => 0,
+        "one" => 1, "two" => 2, "three" => 3, "four" => 4, "five" => 5,
+        "six" => 6, "seven" => 7, "eight" => 8, "nine" => 9,
+        "ten" => 10, "eleven" => 11, "twelve" => 12, "thirteen" => 13,
+        "fourteen" => 14, "fifteen" => 15, "sixteen" => 16, "seventeen" => 17,
+        "eighteen" => 18, "nineteen" => 19,
+        "twenty" => 20, "thirty" => 30, "forty" => 40, "fifty" => 50,
+        "sixty" => 60, "seventy" => 70, "eighty" => 80, "ninety" => 90,
+        _ => return None,
+    })
+}
+
+fn classify_number_word(w: &str) -> Option<NumTok> {
+    if let Some(v) = number_word_value(w) {
+        return Some(NumTok::Small(v));
+    }
+    match w {
+        "hundred" => Some(NumTok::Hundred),
+        "thousand" => Some(NumTok::Scale(1_000)),
+        "million" => Some(NumTok::Scale(1_000_000)),
+        "billion" => Some(NumTok::Scale(1_000_000_000)),
+        _ => None,
+    }
+}
+
+/// Classify a (possibly hyphen-compound) core like "twenty-three".
+/// Returns `None` unless EVERY hyphen part is a number word.
+fn classify_number_core(core: &str) -> Option<Vec<NumTok>> {
+    if core.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in core.split('-') {
+        out.push(classify_number_word(part)?);
+    }
+    Some(out)
+}
+
+fn single_digit_value(w: &str) -> Option<u8> {
+    match number_word_value(w) {
+        Some(v) if v <= 9 => Some(v as u8),
+        _ => None,
+    }
+}
+
+fn number_tokens_to_value(toks: &[NumTok]) -> u128 {
+    let mut result: u128 = 0;
+    let mut current: u128 = 0;
+    for t in toks {
+        match t {
+            NumTok::Small(v) => current += *v as u128,
+            NumTok::Hundred => {
+                if current == 0 {
+                    current = 1;
+                }
+                current *= 100;
+            }
+            NumTok::Scale(s) => {
+                if current == 0 {
+                    current = 1;
+                }
+                result += current * *s;
+                current = 0;
+            }
+        }
+    }
+    result + current
+}
+
+struct NumberChunk {
+    lead: String,
+    core: String,
+    lcore: String,
+    trail: String,
+}
+
+impl NumberChunk {
+    fn raw(&self) -> String {
+        format!("{}{}{}", self.lead, self.core, self.trail)
+    }
+}
+
+/// Split a whitespace chunk into (leading punctuation, core, trailing punctuation).
+/// Interior hyphens/apostrophes stay in the core (only the ends are trimmed).
+fn split_number_chunk(raw: &str) -> NumberChunk {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut start = 0;
+    let mut end = chars.len();
+    while start < end && !chars[start].is_alphanumeric() {
+        start += 1;
+    }
+    while end > start && !chars[end - 1].is_alphanumeric() {
+        end -= 1;
+    }
+    let lead: String = chars[..start].iter().collect();
+    let core: String = chars[start..end].iter().collect();
+    let trail: String = chars[end..].iter().collect();
+    let lcore = core.to_lowercase();
+    NumberChunk { lead, core, lcore, trail }
+}
+
+/// Convert spoken number words in `text` into digits. English only.
+///
+/// Handles cardinals ("twenty three" -> "23"), scales ("one hundred forty
+/// thousand" -> "140000"), decimals ("two point five" -> "2.5"), and attaches
+/// "percent" -> "%" and "dollars" -> "$". Conservative by design: words that
+/// merely contain a number ("fourplex", "five-year") are left alone, a scale
+/// word never starts a run on its own, and runs never cross punctuation.
+pub fn words_to_digits(text: &str) -> String {
+    let chunks: Vec<NumberChunk> = text.split(' ').map(split_number_chunk).collect();
+    let mut out: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut i = 0;
+
+    while i < chunks.len() {
+        let first = match classify_number_core(&chunks[i].lcore) {
+            Some(f) => f,
+            None => {
+                out.push(chunks[i].raw());
+                i += 1;
+                continue;
+            }
+        };
+
+        // A scale word ("thousand"/"million"/"billion") must never START a run on
+        // its own — only continue one. Prevents "million" -> "1000000" and leaves a
+        // post-decimal scale as a readable word ("2.2 million").
+        if first.len() == 1 {
+            if let NumTok::Scale(_) = first[0] {
+                out.push(chunks[i].raw());
+                i += 1;
+                continue;
+            }
+        }
+
+        let lead = chunks[i].lead.clone();
+        let mut numtoks = first;
+        let mut j = i;
+        let mut decimal: Option<String> = None;
+
+        loop {
+            if !chunks[j].trail.is_empty() {
+                break;
+            }
+            if j + 1 >= chunks.len() || !chunks[j + 1].lead.is_empty() {
+                break;
+            }
+            let next_lcore = chunks[j + 1].lcore.as_str();
+
+            // Decimal: "point" followed by one or more single digits.
+            if next_lcore == "point" && chunks[j + 1].trail.is_empty() {
+                let mut k = j + 2;
+                let mut digits = String::new();
+                let mut last = j;
+                while k < chunks.len() && chunks[k].lead.is_empty() {
+                    match single_digit_value(&chunks[k].lcore) {
+                        Some(d) => {
+                            digits.push((b'0' + d) as char);
+                            last = k;
+                            let stop = !chunks[k].trail.is_empty();
+                            k += 1;
+                            if stop {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                if !digits.is_empty() {
+                    decimal = Some(digits);
+                    j = last;
+                }
+                break;
+            }
+
+            match classify_number_core(next_lcore) {
+                Some(t) => {
+                    numtoks.extend(t);
+                    j += 1;
+                }
+                None => break,
+            }
+        }
+
+        let intval = number_tokens_to_value(&numtoks);
+        let mut numstr = match &decimal {
+            Some(dec) => format!("{}.{}", intval, dec),
+            None => intval.to_string(),
+        };
+
+        // Unit attachment: "<n> percent" -> "<n>%", "<n> dollars" -> "$<n>".
+        let mut trail = chunks[j].trail.clone();
+        if trail.is_empty() && j + 1 < chunks.len() && chunks[j + 1].lead.is_empty() {
+            match chunks[j + 1].lcore.as_str() {
+                "percent" => {
+                    numstr.push('%');
+                    trail = chunks[j + 1].trail.clone();
+                    j += 1;
+                }
+                "dollars" | "dollar" => {
+                    numstr = format!("${}", numstr);
+                    trail = chunks[j + 1].trail.clone();
+                    j += 1;
+                }
+                _ => {}
+            }
+        }
+
+        out.push(format!("{}{}{}", lead, numstr, trail));
+        i = j + 1;
+    }
+
+    out.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +795,64 @@ mod tests {
             "got double-counted result: {}",
             result
         );
+    }
+
+    // ── words_to_digits (inverse text normalization) ──────────────────────────
+
+    #[test]
+    fn test_words_to_digits_basic_cardinals() {
+        assert_eq!(words_to_digits("twenty three"), "23");
+        assert_eq!(words_to_digits("twenty-three"), "23");
+        assert_eq!(words_to_digits("three thousand five hundred"), "3500");
+        assert_eq!(words_to_digits("one hundred forty thousand"), "140000");
+    }
+
+    #[test]
+    fn test_words_to_digits_units() {
+        assert_eq!(words_to_digits("ten percent"), "10%");
+        assert_eq!(words_to_digits("five dollars"), "$5");
+        assert_eq!(
+            words_to_digits("cap it at ninety nine point nine percent"),
+            "cap it at 99.9%"
+        );
+    }
+
+    #[test]
+    fn test_words_to_digits_decimals_and_scale() {
+        assert_eq!(words_to_digits("two point five"), "2.5");
+        assert_eq!(
+            words_to_digits("value capped at two point two million"),
+            "value capped at 2.2 million"
+        );
+        assert_eq!(words_to_digits("we did two million in volume"), "we did 2000000 in volume");
+    }
+
+    #[test]
+    fn test_words_to_digits_in_context() {
+        assert_eq!(words_to_digits("I need one appraiser on this"), "I need 1 appraiser on this");
+        assert_eq!(
+            words_to_digits("Levon reviewed three reports today"),
+            "Levon reviewed 3 reports today"
+        );
+        assert_eq!(words_to_digits("send it to underwriting"), "send it to underwriting");
+    }
+
+    #[test]
+    fn test_words_to_digits_does_not_mangle() {
+        assert_eq!(words_to_digits("we need a fourplex"), "we need a fourplex");
+        assert_eq!(words_to_digits("a five-year plan"), "a five-year plan");
+        assert_eq!(words_to_digits("form 1004 and 1007"), "form 1004 and 1007");
+        assert_eq!(words_to_digits("a thousand dollars"), "a thousand dollars");
+    }
+
+    #[test]
+    fn test_words_to_digits_punctuation_boundaries() {
+        assert_eq!(words_to_digits("twenty, three please"), "20, 3 please");
+        assert_eq!(words_to_digits("that's twenty three."), "that's 23.");
+    }
+
+    #[test]
+    fn test_words_to_digits_empty() {
+        assert_eq!(words_to_digits(""), "");
     }
 }
