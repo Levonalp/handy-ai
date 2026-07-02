@@ -21,6 +21,20 @@ USER CUSTOM VOCABULARY & RULES:
 const NO_MEMORY_FALLBACK: &str =
     "(No custom vocabulary file is configured. Apply the rules above using standard spelling.)";
 
+/// Small local instruct models default to answering a question-shaped
+/// dictation conversationally, even when the ROLE section in the injected
+/// memory explicitly forbids it (confirmed 2026-07-02: qwen2.5:3b-instruct
+/// answered "Are you working?" with "I'm ready and waiting..." despite that
+/// exact prohibition, in multiple prompt orderings) — a system-prompt-only
+/// instruction isn't a strong enough override for the model's RLHF "be
+/// helpful, answer questions" prior. A concrete example of the failure mode,
+/// placed at the end of the system prompt (highest-recency context),
+/// reliably corrects it. This is layer one of two — see
+/// `handy2::wrap_for_reformat` for the user-turn reinforcement that closes
+/// the remaining gap (list-formatting and other rules still apply normally
+/// through both layers).
+const ANTI_ANSWER_EXAMPLE: &str = "\n\nEXAMPLE (critical — follow exactly):\nDictation: \"Are you working?\"\nCorrect output: \"Are you working?\"\nWRONG output (do not do this): \"Yes, I am working.\" or any reply to the question.";
+
 pub struct BuiltPrompt {
     pub system_prompt: String,
     pub truncated: bool,
@@ -43,7 +57,7 @@ pub fn build(memory: Option<&str>, addendum: Option<&str>) -> BuiltPrompt {
         }
         _ => NO_MEMORY_FALLBACK,
     };
-    let mut system_prompt = format!("{BASE_TEMPLATE}{memory_block}");
+    let mut system_prompt = format!("{BASE_TEMPLATE}{memory_block}{ANTI_ANSWER_EXAMPLE}");
     if let Some(extra) = addendum {
         if !extra.trim().is_empty() {
             system_prompt.push_str("\n\n");
@@ -78,7 +92,25 @@ mod tests {
     #[test]
     fn addendum_appends_after_blank_line() {
         let p = build(Some("vocab"), Some("Rewrite professionally."));
-        assert!(p.system_prompt.contains("vocab\n\nRewrite professionally."));
+        assert!(p.system_prompt.contains("vocab"));
+        assert!(p.system_prompt.ends_with("\n\nRewrite professionally."));
+    }
+
+    #[test]
+    fn anti_answer_example_present() {
+        let p = build(None, None);
+        assert!(p.system_prompt.contains("Are you working?"));
+        assert!(p.system_prompt.contains("WRONG output"));
+    }
+
+    #[test]
+    fn anti_answer_example_ordered_between_memory_and_addendum() {
+        let p = build(Some("vocab-marker-xyz"), Some("addendum-marker-abc"));
+        let vocab_pos = p.system_prompt.find("vocab-marker-xyz").unwrap();
+        let example_pos = p.system_prompt.find("WRONG output").unwrap();
+        let addendum_pos = p.system_prompt.find("addendum-marker-abc").unwrap();
+        assert!(vocab_pos < example_pos);
+        assert!(example_pos < addendum_pos);
     }
 
     #[test]
