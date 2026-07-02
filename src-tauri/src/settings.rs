@@ -547,7 +547,7 @@ pub fn default_h2_routes() -> Vec<Route> {
         Route {
             id: "polish".to_string(),
             trigger: Some("Polish command".to_string()),
-            ollama_model: "kimi-k2.6".to_string(),
+            ollama_model: "qwen2.5:3b-instruct".to_string(),
             prompt_addendum: Some(
                 "Rewrite the following dictation into a highly professional, structured email \
                  or document suitable for corporate communications."
@@ -557,7 +557,7 @@ pub fn default_h2_routes() -> Vec<Route> {
         Route {
             id: "prompt_engineering".to_string(),
             trigger: Some("Prompt engineering command".to_string()),
-            ollama_model: "qwen3-coder-next".to_string(),
+            ollama_model: "qwen2.5:3b-instruct".to_string(),
             prompt_addendum: Some(
                 "Format this as a highly detailed, structured prompt for an AI coding agent \
                  like Claude or Cursor."
@@ -567,7 +567,7 @@ pub fn default_h2_routes() -> Vec<Route> {
         Route {
             id: "standard".to_string(),
             trigger: None,
-            ollama_model: "deepseek-v4-flash".to_string(),
+            ollama_model: "qwen2.5:3b-instruct".to_string(),
             prompt_addendum: None,
         },
     ]
@@ -577,8 +577,8 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
     let mut providers = vec![
         PostProcessProvider {
             id: "ollama".to_string(),
-            label: "Ollama Cloud".to_string(),
-            base_url: "https://ollama.com/v1".to_string(),
+            label: "Local LLM (Ollama)".to_string(),
+            base_url: "http://localhost:11435/v1".to_string(),
             allow_base_url_edit: true,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: false,
