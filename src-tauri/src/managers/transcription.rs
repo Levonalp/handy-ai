@@ -729,8 +729,8 @@ impl TranscriptionManager {
 
         // Deterministic vocabulary corrections from the personal memory file
         // (unconditional mishear-table rows only — context-dependent rows stay
-        // LLM-side). Applies in every mode, offline, sub-millisecond, so the
-        // raw path gets domain terms right without an LLM.
+        // LLM-side). Applies in every mode, offline; rules are cached on file
+        // mtime/len so the per-dictation cost is a stat + string scan.
         let final_result = crate::handy2::corrections::apply_from_memory_file(
             &final_result,
             settings.h2_memory_file_path.as_deref(),

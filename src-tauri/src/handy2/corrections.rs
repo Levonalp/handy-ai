@@ -5,6 +5,8 @@
 //! applied here.
 
 use regex::Regex;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 pub struct CorrectionRule {
@@ -45,7 +47,11 @@ fn table_cells(line: &str) -> Option<(String, String)> {
 }
 
 fn is_separator_or_header(heard: &str, write: &str) -> bool {
-    heard.chars().all(|c| c == '-' || c == ' ')
+    // Alignment separators may carry colons (|:---|---:|) after an Obsidian or
+    // Prettier table re-format — treat any dash/space/colon-only cell as one.
+    let sep = |s: &str| s.chars().all(|c| matches!(c, '-' | ' ' | ':'));
+    sep(heard)
+        || sep(write)
         || heard.eq_ignore_ascii_case("Heard (wrong)")
         || write.eq_ignore_ascii_case("Write (right)")
 }
@@ -95,55 +101,101 @@ pub fn parse_rules(memory: &str) -> Vec<CorrectionRule> {
     rules
 }
 
-/// If the matched text began uppercase and the replacement is lowercase,
-/// uppercase the replacement's first letter (keeps sentence starts intact).
-fn match_case_first(matched: &str, replacement: &str) -> String {
-    let starts_upper = matched
-        .chars()
-        .find(|c| c.is_alphabetic())
-        .is_some_and(|c| c.is_uppercase());
-    let repl_lower = replacement.chars().next().is_some_and(|c| c.is_lowercase());
-    if starts_upper && repl_lower {
-        let mut cs = replacement.chars();
-        match cs.next() {
-            Some(f) => f.to_uppercase().collect::<String>() + cs.as_str(),
-            None => replacement.to_string(),
-        }
-    } else {
-        replacement.to_string()
+/// True when a match at `start` in `text` begins a sentence: start of text, or
+/// preceded (ignoring spaces/tabs) by end punctuation or a newline. STT often
+/// capitalizes proper-noun-shaped mishears mid-sentence ("call the Sloan
+/// officer"), so the match's own case says nothing about position.
+fn sentence_initial(text: &str, start: usize) -> bool {
+    let last = text[..start].trim_end_matches([' ', '\t']).chars().last();
+    matches!(last, None | Some('.' | '!' | '?' | '…' | '\n' | '\r'))
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + cs.as_str(),
+        None => String::new(),
     }
 }
 
 pub fn apply(text: &str, rules: &[CorrectionRule]) -> String {
     let mut out = text.to_string();
     for rule in rules {
-        out = rule
+        let replaced = rule
             .pattern
             .replace_all(&out, |caps: &regex::Captures| {
-                match_case_first(&caps[0], &rule.replacement)
+                let m = caps.get(0).expect("group 0 always present");
+                let repl_lower = rule
+                    .replacement
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_lowercase());
+                if repl_lower && sentence_initial(&out, m.start()) {
+                    capitalize_first(&rule.replacement)
+                } else {
+                    rule.replacement.clone()
+                }
             })
             .into_owned();
+        out = replaced;
     }
     out
 }
 
-/// Convenience for the transcription pipeline: fresh-read the memory file
-/// (same policy as `memory.rs` — the user edits it live), parse, apply.
+struct CachedRules {
+    path: String,
+    mtime: SystemTime,
+    len: u64,
+    rules: Arc<Vec<CorrectionRule>>,
+}
+
+static RULE_CACHE: OnceLock<Mutex<Option<CachedRules>>> = OnceLock::new();
+
+/// Entry point for the transcription pipeline. Live-edit semantics are kept
+/// (rules reload when the file's mtime or length changes) but the ~7ms
+/// parse + 32-regex compile is paid only on change, not per dictation.
 /// Unset/unreadable path ⇒ input returned unchanged.
 pub fn apply_from_memory_file(text: &str, path: Option<&str>) -> String {
     let Some(path) = path else {
         return text.to_string();
     };
-    match std::fs::read_to_string(path) {
-        Ok(memory) => {
-            let rules = parse_rules(&memory);
-            apply(text, &rules)
-        }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
         Err(e) => {
             log::debug!("corrections: memory file unreadable ({path}): {e}; skipping");
-            text.to_string()
+            return text.to_string();
+        }
+    };
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let len = meta.len();
+
+    let cache = RULE_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fresh = matches!(
+        guard.as_ref(),
+        Some(c) if c.path == path && c.mtime == mtime && c.len == len
+    );
+    if !fresh {
+        match std::fs::read_to_string(path) {
+            Ok(memory) => {
+                *guard = Some(CachedRules {
+                    path: path.to_string(),
+                    mtime,
+                    len,
+                    rules: Arc::new(parse_rules(&memory)),
+                });
+            }
+            Err(e) => {
+                log::debug!("corrections: memory file unreadable ({path}): {e}; skipping");
+                return text.to_string();
+            }
         }
     }
+    let rules = Arc::clone(&guard.as_ref().expect("cache populated above").rules);
+    drop(guard);
+    apply(text, &rules)
 }
 
 /// Memory text minus the table rows `apply` already handles (they are applied
@@ -217,6 +269,61 @@ mod tests {
             apply("the sloan officer called", &rules),
             "the loan officer called"
         );
+        // After end punctuation counts as sentence-initial.
+        assert_eq!(
+            apply("Done. Sloan officer next", &rules),
+            "Done. Loan officer next"
+        );
+    }
+
+    #[test]
+    fn mid_sentence_uppercase_match_is_not_capitalized() {
+        // STT capitalizes proper-noun-shaped mishears anywhere; position, not
+        // the match's case, decides capitalization (review finding #2).
+        let rules = parse_rules(FIXTURE);
+        assert_eq!(
+            apply("call the Sloan officer now", &rules),
+            "call the loan officer now"
+        );
+    }
+
+    #[test]
+    fn alignment_separator_rows_are_not_rules() {
+        // Obsidian/Prettier may rewrite |---|---| as |:---|---:| (finding #3).
+        let fixture = "\
+## Dictation Corrections
+| Heard (wrong) | Write (right) |
+|:---|---:|
+| Powery | Bowery |
+";
+        let rules = parse_rules(fixture);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].heard, "Powery");
+        // And the separator must survive prompt slimming.
+        assert!(strip_deterministic_rows(fixture).contains(":---"));
+    }
+
+    #[test]
+    fn cache_reloads_when_file_changes() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("h2_corrections_cache_test.md");
+        let table = |wrong: &str, right: &str| {
+            format!("## Dictation Corrections\n| Heard (wrong) | Write (right) |\n|---|---|\n| {wrong} | {right} |\n")
+        };
+        std::fs::write(&path, table("Powery", "Bowery")).expect("write v1");
+        let p = path.to_str().expect("utf8 path");
+        assert_eq!(
+            apply_from_memory_file("Powery here", Some(p)),
+            "Bowery here"
+        );
+        // Different content AND different length so the (mtime,len) key flips
+        // even on filesystems with coarse mtime granularity.
+        std::fs::write(&path, table("Powery", "Bowery Valuation")).expect("write v2");
+        assert_eq!(
+            apply_from_memory_file("Powery here", Some(p)),
+            "Bowery Valuation here"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
