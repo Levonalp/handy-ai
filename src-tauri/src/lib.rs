@@ -550,6 +550,41 @@ pub fn run(cli_args: CliArgs) {
 
             initialize_core_logic(&app_handle);
 
+            // h2: warm the local LLM once so the first polish after boot is warm.
+            // Fire-and-forget; failure is fine (offline, Ollama down, h2 off).
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let settings = crate::settings::get_settings(&app_handle);
+                    if settings.h2_enabled {
+                        if let (Some(p), Ok(key)) = (
+                            settings
+                                .post_process_providers
+                                .iter()
+                                .find(|p| p.id == "ollama")
+                                .cloned(),
+                            crate::handy2::secrets::get_key(),
+                        ) {
+                            let model = settings
+                                .h2_routes
+                                .iter()
+                                .find(|r| r.trigger.is_none())
+                                .map(|r| r.ollama_model.clone())
+                                .unwrap_or_default();
+                            let _ = crate::llm_client::send_chat_completion(
+                                &p,
+                                key,
+                                &model,
+                                "OK".into(),
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
+
             // Pre-warm GPU/accelerator enumeration on a background thread.
             // The first call into transcribe_rs::whisper_cpp::gpu::list_gpu_devices
             // loads the Metal/Vulkan backend and probes devices, which can take

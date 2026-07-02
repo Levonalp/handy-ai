@@ -213,6 +213,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
             Some(json_schema),
             reasoning_effort.clone(),
             reasoning.clone(),
+            None,
         )
         .await
         {

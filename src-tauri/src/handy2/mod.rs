@@ -52,6 +52,14 @@ fn strip_reformat_markers(text: &str) -> String {
     out.to_string()
 }
 
+/// Output token cap for the reformat completion: ~2x the input length (3
+/// tokens/word is roughly 2x words→tokens), floor 96 — reformatting can't
+/// legitimately need more than that, and the floor keeps short dictation
+/// from being clipped.
+fn output_cap_for(cleaned_text: &str) -> u32 {
+    ((cleaned_text.split_whitespace().count() as u32) * 3).max(96)
+}
+
 /// v2 post-processing: route → memory → prompt → Ollama. Returns the formatted
 /// text, or `None` to fall back to the raw transcript (never lose dictation).
 pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option<String> {
@@ -106,6 +114,8 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
         }
     };
 
+    let cap = output_cap_for(&decision.cleaned_text);
+
     match crate::llm_client::send_chat_completion_with_schema(
         &provider,
         api_key,
@@ -115,6 +125,7 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
         None, // structured output off for the Ollama preset (revisit per spec §11)
         None,
         None,
+        Some(cap),
     )
     .await
     {
@@ -189,5 +200,29 @@ mod tests {
         // instead of pasting literal "<<<DICTATION>>><<<END>>>" tokens.
         assert_eq!(strip_reformat_markers("<<<DICTATION>>><<<END>>>"), "");
         assert_eq!(strip_reformat_markers("<<<DICTATION>>>\n<<<END>>>"), "");
+    }
+
+    #[test]
+    fn output_cap_floors_at_96_for_short_input() {
+        // A few words * 3 is well under 96, so the floor applies.
+        assert_eq!(output_cap_for("turn on the lights"), 96);
+        assert_eq!(output_cap_for(""), 96);
+    }
+
+    #[test]
+    fn output_cap_scales_at_3x_word_count_above_the_floor() {
+        // 40 words * 3 = 120, comfortably above the 96 floor.
+        let text = "word ".repeat(40);
+        assert_eq!(output_cap_for(text.trim()), 120);
+    }
+
+    #[test]
+    fn output_cap_boundary_at_32_words_matches_the_floor() {
+        // 32 words * 3 = 96 exactly: floor and formula agree at the boundary.
+        let text = "word ".repeat(32);
+        assert_eq!(output_cap_for(text.trim()), 96);
+        // One more word should push strictly past the floor.
+        let text = "word ".repeat(33);
+        assert_eq!(output_cap_for(text.trim()), 99);
     }
 }
