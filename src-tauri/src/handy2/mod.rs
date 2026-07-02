@@ -6,6 +6,7 @@
 //! against Handy's existing `llm_client` and is invoked from `actions.rs`
 //! only when `settings.h2_enabled` is true.
 
+pub mod corrections;
 pub mod memory;
 pub mod prompt;
 pub mod routing;
@@ -32,8 +33,14 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
             None
         }
     };
+    // Rows the corrections layer already applied upstream don't need to ride
+    // the prompt — smaller prefill keeps the local-LLM path fast. Conditional
+    // rows (context-dependent fixes) remain for the model.
+    let slimmed = memory_contents
+        .as_deref()
+        .map(corrections::strip_deterministic_rows);
     let built = prompt::build(
-        memory_contents.as_deref(),
+        slimmed.as_deref(),
         decision.route.prompt_addendum.as_deref(),
     );
 

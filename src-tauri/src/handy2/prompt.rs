@@ -63,7 +63,9 @@ mod tests {
     #[test]
     fn includes_memory_verbatim() {
         let p = build(Some("- VMS (Valuation Management System)"), None);
-        assert!(p.system_prompt.contains("- VMS (Valuation Management System)"));
+        assert!(p
+            .system_prompt
+            .contains("- VMS (Valuation Management System)"));
         assert!(!p.truncated);
     }
 

@@ -338,13 +338,33 @@ enum NumTok {
 fn number_word_value(w: &str) -> Option<u64> {
     Some(match w {
         "zero" => 0,
-        "one" => 1, "two" => 2, "three" => 3, "four" => 4, "five" => 5,
-        "six" => 6, "seven" => 7, "eight" => 8, "nine" => 9,
-        "ten" => 10, "eleven" => 11, "twelve" => 12, "thirteen" => 13,
-        "fourteen" => 14, "fifteen" => 15, "sixteen" => 16, "seventeen" => 17,
-        "eighteen" => 18, "nineteen" => 19,
-        "twenty" => 20, "thirty" => 30, "forty" => 40, "fifty" => 50,
-        "sixty" => 60, "seventy" => 70, "eighty" => 80, "ninety" => 90,
+        "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        "eleven" => 11,
+        "twelve" => 12,
+        "thirteen" => 13,
+        "fourteen" => 14,
+        "fifteen" => 15,
+        "sixteen" => 16,
+        "seventeen" => 17,
+        "eighteen" => 18,
+        "nineteen" => 19,
+        "twenty" => 20,
+        "thirty" => 30,
+        "forty" => 40,
+        "fifty" => 50,
+        "sixty" => 60,
+        "seventy" => 70,
+        "eighty" => 80,
+        "ninety" => 90,
         _ => return None,
     })
 }
@@ -435,7 +455,12 @@ fn split_number_chunk(raw: &str) -> NumberChunk {
     let core: String = chars[start..end].iter().collect();
     let trail: String = chars[end..].iter().collect();
     let lcore = core.to_lowercase();
-    NumberChunk { lead, core, lcore, trail }
+    NumberChunk {
+        lead,
+        core,
+        lcore,
+        trail,
+    }
 }
 
 /// Convert spoken number words in `text` into digits. English only.
@@ -824,17 +849,26 @@ mod tests {
             words_to_digits("value capped at two point two million"),
             "value capped at 2.2 million"
         );
-        assert_eq!(words_to_digits("we did two million in volume"), "we did 2000000 in volume");
+        assert_eq!(
+            words_to_digits("we did two million in volume"),
+            "we did 2000000 in volume"
+        );
     }
 
     #[test]
     fn test_words_to_digits_in_context() {
-        assert_eq!(words_to_digits("I need one appraiser on this"), "I need 1 appraiser on this");
+        assert_eq!(
+            words_to_digits("I need one appraiser on this"),
+            "I need 1 appraiser on this"
+        );
         assert_eq!(
             words_to_digits("Levon reviewed three reports today"),
             "Levon reviewed 3 reports today"
         );
-        assert_eq!(words_to_digits("send it to underwriting"), "send it to underwriting");
+        assert_eq!(
+            words_to_digits("send it to underwriting"),
+            "send it to underwriting"
+        );
     }
 
     #[test]
