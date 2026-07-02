@@ -47,14 +47,25 @@ async fn question_shaped_dictation_is_not_answered() {
     ensure_key();
     let settings = test_settings();
     for question in ["Are you working?", "Is this thing on?", "What time is it?"] {
-        let out = super::post_process(&settings, question)
-            .await
-            .unwrap_or_else(|| panic!("post_process returned None for {question:?}"));
-        assert_eq!(
-            out.trim(),
-            question,
-            "model answered/altered the question instead of reformatting it verbatim: got {out:?}"
-        );
+        // `post_process` has two ways to end up with the correct, safe
+        // result for question-shaped dictation:
+        //   - the model reformats faithfully -> Some(verbatim question)
+        //   - the model answers conversationally -> the similarity guard
+        //     (mod.rs `output_resembles_input`) rejects it -> None, and the
+        //     caller (actions.rs) pastes the raw transcript, which for a
+        //     no-hotword input is the verbatim question by construction of
+        //     `routing::route`.
+        // Both are correct end states; only a `Some` containing something
+        // *other than* the verbatim question means an answer slipped past
+        // every defense layer.
+        match super::post_process(&settings, question).await {
+            None => {} // guard caught an answer-shaped completion and fell back safely
+            Some(out) => assert_eq!(
+                out.trim(),
+                question,
+                "model answered/altered the question instead of reformatting it verbatim: got {out:?}"
+            ),
+        }
     }
 }
 
@@ -75,5 +86,32 @@ async fn instruction_shaped_dictation_is_not_executed() {
     assert!(
         !lower.contains("task 1") && !lower.contains("task list") && !lower.contains("which task"),
         "model appears to have acted on the instruction instead of transcribing it: {out:?}"
+    );
+}
+
+/// Regression coverage for the C3 similarity guard's other edge: a
+/// legitimate Polish-route rewrite adds enough new words (greetings,
+/// connective phrasing) to be at real risk of a false-reject if the
+/// similarity threshold is set too high. This must come back as `Some` with
+/// a professional rewrite — never `None` (guard falsely rejecting a good
+/// reformat) and never the raw dictation echoed unstructured.
+#[tokio::test]
+#[ignore]
+async fn polish_route_rewrite_is_not_rejected_by_similarity_guard() {
+    ensure_key();
+    let settings = test_settings();
+    let dictation = "Polish command, tell the credit team the appraisal is approved";
+    let out = super::post_process(&settings, dictation)
+        .await
+        .expect("post_process should return Some: a legitimate professional rewrite must not be rejected by the similarity guard");
+    let lower = out.to_lowercase();
+    assert!(
+        lower.contains("appraisal") && lower.contains("approv"),
+        "expected the rewrite to preserve the dictation's core content, got: {out:?}"
+    );
+    assert_ne!(
+        out.trim(),
+        "tell the credit team the appraisal is approved",
+        "expected a polished rewrite, not the cleaned dictation echoed verbatim: got {out:?}"
     );
 }

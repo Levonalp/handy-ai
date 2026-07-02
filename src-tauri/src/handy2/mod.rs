@@ -60,6 +60,31 @@ fn output_cap_for(cleaned_text: &str) -> u32 {
     ((cleaned_text.split_whitespace().count() as u32) * 3).max(96)
 }
 
+/// Defense-in-depth layer three (final gate) against the small local model
+/// answering a question/instruction-shaped dictation instead of reformatting
+/// it (see `wrap_for_reformat` for layer two and its root-cause note).
+/// Reformatted text is made (mostly) of the input's words; an answer is made
+/// of new words. Reject when too little of the OUTPUT is drawn from the input.
+fn output_resembles_input(input: &str, output: &str) -> bool {
+    let norm = |s: &str| -> std::collections::HashSet<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_lowercase())
+            .collect()
+    };
+    let inp = norm(input);
+    let out_words: Vec<String> = output
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect();
+    if out_words.is_empty() {
+        return false;
+    }
+    let hits = out_words.iter().filter(|w| inp.contains(*w)).count();
+    (hits as f64 / out_words.len() as f64) >= 0.55
+}
+
 /// v2 post-processing: route → memory → prompt → Ollama. Returns the formatted
 /// text, or `None` to fall back to the raw transcript (never lose dictation).
 pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option<String> {
@@ -138,6 +163,17 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
                 // tokens into the focused app, so treat it the same as any
                 // other failed reformat: fall back to the raw transcript.
                 error!("h2: completion was only wrapper markers, no content");
+                None
+            } else if !output_resembles_input(&decision.cleaned_text, &stripped) {
+                // Defense-in-depth layer three: the wrap+markers (layer two)
+                // and few-shot example (layer one) still occasionally let a
+                // conversational answer through. If the output isn't mostly
+                // made of the input's own words, it's an answer, not a
+                // reformat — fall back to the raw transcript rather than
+                // paste a conversational reply into the focused app.
+                error!(
+                    "h2: output failed similarity guard (answer-shaped); pasting raw transcript"
+                );
                 None
             } else {
                 Some(stripped)
@@ -224,5 +260,21 @@ mod tests {
         // One more word should push strictly past the floor.
         let text = "word ".repeat(33);
         assert_eq!(output_cap_for(text.trim()), 99);
+    }
+
+    #[test]
+    fn similarity_guard_accepts_reformat_rejects_answer() {
+        assert!(output_resembles_input(
+            "Are you working?",
+            "Are you working?"
+        ));
+        assert!(output_resembles_input(
+            "tell the team we need three things first the panel review second the fee schedule",
+            "We need three things:\n- Panel review\n- Fee schedule"
+        ));
+        assert!(!output_resembles_input(
+            "Are you working?",
+            "I'm ready and waiting. Let me know what you need assistance with."
+        ));
     }
 }
