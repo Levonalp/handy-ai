@@ -472,7 +472,10 @@ fn default_autostart_enabled() -> bool {
 }
 
 fn default_update_checks_enabled() -> bool {
-    true
+    // Fork safety: the stock updater points at github.com/cjpais/Handy.
+    // Accepting an upstream release would replace this fork and silently
+    // delete the h2 layer. Upstream updates are taken deliberately via git.
+    false
 }
 
 fn default_selected_language() -> String {
