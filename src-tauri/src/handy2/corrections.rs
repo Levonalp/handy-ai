@@ -213,6 +213,33 @@ pub fn strip_deterministic_rows(memory: &str) -> String {
         .join("\n")
 }
 
+const LLM_SECTION_ALLOWLIST: [&str; 4] = [
+    "## Dictation Corrections",
+    "## Number Rules",
+    "## Stock Phrases",
+    "## Formatting & Style Rules",
+];
+
+/// The LLM prompt no longer carries the whole memory file: deterministic
+/// layers own vocabulary/spelling, and the wrap+example own the ROLE rules.
+/// Keep only sections the model still needs, minus already-applied rows.
+pub fn slim_memory_for_llm(memory: &str) -> String {
+    let mut kept = String::new();
+    let mut keeping = false;
+    for line in memory.lines() {
+        if line.trim_start().starts_with("## ") {
+            keeping = LLM_SECTION_ALLOWLIST
+                .iter()
+                .any(|h| line.trim_start().starts_with(h));
+        }
+        if keeping {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    strip_deterministic_rows(&kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +386,27 @@ mod tests {
         assert!(stripped.contains("Valley (value context)"));
         assert!(stripped.contains("our bi / RB eyes"));
         assert!(stripped.contains("Number Rules"));
+    }
+
+    #[test]
+    fn slim_keeps_llm_sections_drops_deterministic_ones() {
+        let mem = "\
+## ⚠️ ROLE — READ FIRST\nrole text\n\
+## Identity\n- Levon\n\
+## Dictation Corrections (apply these exact fixes when heard)\n\
+| Heard (wrong) | Write (right) |\n|---|---|\n\
+| Powery | Bowery |\n| Valley (value context) | value |\n\
+## Number Rules (critical)\n- budget 140,000\n\
+## Stock Phrases (preserve verbatim)\n- \"Best, Levon\"\n\
+## Formatting & Style Rules\n- keep imperative voice\n";
+        let slim = slim_memory_for_llm(mem);
+        assert!(!slim.contains("ROLE"));
+        assert!(!slim.contains("Identity"));
+        assert!(!slim.contains("| Powery | Bowery |")); // deterministic row gone
+        assert!(slim.contains("Valley (value context)")); // conditional row kept
+        assert!(slim.contains("Number Rules"));
+        assert!(slim.contains("Stock Phrases"));
+        assert!(slim.contains("Formatting & Style Rules"));
     }
 
     #[test]

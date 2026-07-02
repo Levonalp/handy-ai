@@ -71,15 +71,20 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
         }
     };
     // Rows the corrections layer already applied upstream don't need to ride
-    // the prompt — smaller prefill keeps the local-LLM path fast. Conditional
+    // the prompt, and deterministic layers now own vocabulary/spelling while
+    // the wrap+example own the ROLE rules — keep only the sections the LLM
+    // still needs. Smaller prefill keeps the local-LLM path fast. Conditional
     // rows (context-dependent fixes) remain for the model.
     let slimmed = memory_contents
         .as_deref()
-        .map(corrections::strip_deterministic_rows);
+        .map(corrections::slim_memory_for_llm);
     let built = prompt::build(
         slimmed.as_deref(),
         decision.route.prompt_addendum.as_deref(),
     );
+    if built.truncated {
+        warn!("h2: memory truncated at 100KB");
+    }
 
     let provider = match settings
         .post_process_providers
