@@ -19,8 +19,19 @@
 //! same clause — "We need to strike that clause from the contract" reads
 //! exactly like a marker if the text after "that" is never inspected. Every
 //! candidate match is therefore additionally screened by
-//! `is_genuine_marker` before it is treated as real; see that function for
-//! the trailing-boundary and clause-echo conditions it checks.
+//! `has_trailing_boundary` before it is treated as real; see that function
+//! for the trailing-boundary conditions it checks.
+//!
+//! Deliberately does *not* attempt to rescue comma-less markers whose
+//! trailing text lacks a clean boundary (e.g. "Send it Monday scratch that
+//! deliver it Tuesday.") by inferring intent from surrounding words. An
+//! earlier revision tried exactly that (an "echo the containing clause's
+//! opening verb" heuristic) and it backfired: it both introduced a new
+//! false-positive deletion on ordinary text and still failed to fire on the
+//! most realistic comma-less self-correction shape (a changed verb). A
+//! missed marker — the words are left in the output, unrecognized — is
+//! always preferable to a wrong deletion, so a comma-less marker with no
+//! other trailing boundary signal is left alone rather than guessed at.
 
 use crate::handy2::corrections::capitalize_first;
 use regex::Regex;
@@ -35,14 +46,14 @@ use std::sync::OnceLock;
 ///
 /// This pattern alone over-matches (see the module doc comment): it finds
 /// every "scratch/strike that" occurrence regardless of what follows, so
-/// every result from it is a *candidate* match that `is_genuine_marker`
+/// every result from it is a *candidate* match that `has_trailing_boundary`
 /// must still confirm before `apply_scratch_that` acts on it.
 ///
 /// Capture group 1 ends immediately after "that", *before* the trailing
-/// `[ \t]*,?` absorption — `is_genuine_marker`'s trailing-boundary check
-/// needs to know whether a comma actually followed "that" in the original
-/// text, which the full match's end (`m.end()`, group 0) can no longer tell
-/// it once that comma has been absorbed into the match itself.
+/// `[ \t]*,?` absorption — `has_trailing_boundary`'s check needs to know
+/// whether a comma actually followed "that" in the original text, which the
+/// full match's end (`m.end()`, group 0) can no longer tell it once that
+/// comma has been absorbed into the match itself.
 fn marker_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -54,7 +65,7 @@ fn marker_regex() -> &'static Regex {
 /// Matches a bare marker with none of `marker_regex`'s optional
 /// comma/whitespace absorption — used only to test whether another marker
 /// immediately follows a candidate match (the "back-to-back" trailing
-/// condition in `is_genuine_marker`), where absorbing surrounding
+/// condition in `has_trailing_boundary`), where absorbing surrounding
 /// punctuation would be irrelevant to the question being asked.
 fn bare_marker_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -73,21 +84,6 @@ fn previous_boundary(text: &str, before: usize) -> usize {
         .rfind(['.', '!', '?', '\n'])
         .map(|i| i + 1)
         .unwrap_or(0)
-}
-
-/// The first maximal run of alphabetic/apostrophe characters found starting
-/// at or after `from` in `text` (skipping any leading non-word characters
-/// such as whitespace/punctuation), lowercased — or `None` if `text[from..]`
-/// has no such run. Apostrophes are included so contractions ("I'll",
-/// "don't") compare as a single word rather than splitting at the `'`.
-fn first_word_lowercased(text: &str, from: usize) -> Option<String> {
-    let rest = &text[from..];
-    let start = rest.find(|c: char| c.is_alphabetic())?;
-    let word: String = rest[start..]
-        .chars()
-        .take_while(|c| c.is_alphabetic() || *c == '\'')
-        .collect();
-    Some(word.to_lowercase())
 }
 
 /// True when `text[word_end..]` — the text immediately after "that" itself,
@@ -126,58 +122,6 @@ fn has_trailing_boundary(text: &str, word_end: usize) -> bool {
         .is_some_and(|m| m.start() == 0)
 }
 
-/// Fallback for a comma-less marker whose trailing text does *not* look
-/// sentence-boundary-shaped (`has_trailing_boundary` returned `false`):
-/// still treat it as genuine if the word immediately after "that"
-/// case-insensitively repeats the first word of the marker's own containing
-/// clause (per `previous_boundary`). Real self-corrections overwhelmingly
-/// restate the same leading verb while replacing a trailing detail ("Call
-/// them now, scratch that, call them later" / "Send it Monday, scratch
-/// that, send it Tuesday") — exactly the shape STT punctuation-dropping
-/// produces when the comma is lost but the words are transcribed correctly.
-/// An ordinary sentence using "scratch/strike that" as a verb phrase
-/// ("strike that clause from the contract", "scratch that itch") has no
-/// reason to echo the clause's own opening word right after "that", so this
-/// check does not reopen the over-matching this module exists to prevent —
-/// it only ever narrows an already-conservative marker pattern further, on
-/// a small, bounded, exact-word-equality condition rather than an
-/// open-ended vocabulary/grammar heuristic.
-///
-/// `word_end` is the same "right after that, pre-absorption" position
-/// `has_trailing_boundary` uses; `marker_start` is the full candidate
-/// match's start (where its own optional leading comma/space may begin).
-fn is_repeated_clause_verb(text: &str, marker_start: usize, word_end: usize) -> bool {
-    let clause_start = previous_boundary(text, marker_start);
-    let Some(clause_word) = first_word_lowercased(text, clause_start) else {
-        return false;
-    };
-    // Guard against the marker matching its own leading word when it sits at
-    // the very start of the string (clause_start == marker_start == 0, so
-    // "clause_start" would otherwise point at the marker's own "scratch"/
-    // "strike" rather than a real preceding clause).
-    if clause_start >= marker_start {
-        return false;
-    }
-    first_word_lowercased(text, word_end).as_deref() == Some(clause_word.as_str())
-}
-
-/// True when a candidate `marker_regex` match should actually be treated as
-/// a self-correction marker: either its trailing context is
-/// sentence-boundary-shaped (`has_trailing_boundary`), or — for the
-/// comma-dropped case that boundary check alone cannot cover — the word
-/// right after it echoes its own clause's opening word
-/// (`is_repeated_clause_verb`). Both checks only ever *reject* a candidate
-/// match; neither can cause a match `marker_regex` didn't already find, so
-/// this function can only make `apply_scratch_that` more conservative than
-/// the bare regex, never less.
-///
-/// `marker_start` is the full match's start; `word_end` is capture group
-/// 1's end (right after "that", before trailing-comma absorption) — see
-/// `has_trailing_boundary`'s doc comment for why that distinction matters.
-fn is_genuine_marker(text: &str, marker_start: usize, word_end: usize) -> bool {
-    has_trailing_boundary(text, word_end) || is_repeated_clause_verb(text, marker_start, word_end)
-}
-
 /// Capitalize the first alphabetic character found while skipping any
 /// leading whitespace in `s`, leaving that whitespace and everything else
 /// untouched. Used at a splice point, which `previous_boundary` guarantees
@@ -195,11 +139,12 @@ fn capitalize_after_leading_whitespace(s: &str) -> String {
 }
 
 /// Drop each "scratch that" / "strike that" self-correction and the clause
-/// it abandons: for every *genuine* marker (see `is_genuine_marker`;
+/// it abandons: for every *genuine* marker (see `has_trailing_boundary`;
 /// candidate matches that read as ordinary sentence content rather than a
-/// self-correction interjection are left untouched), processed left to
-/// right and iteratively so multiple corrections in one utterance all
-/// apply, delete from the start of its containing sentence through the
+/// self-correction interjection — including any comma-less marker whose
+/// trailing text lacks a clean boundary — are left untouched), processed
+/// left to right and iteratively so multiple corrections in one utterance
+/// all apply, delete from the start of its containing sentence through the
 /// marker plus its immediately surrounding comma/space, then fix up
 /// capitalization at the splice.
 pub fn apply_scratch_that(text: &str) -> String {
@@ -212,14 +157,13 @@ pub fn apply_scratch_that(text: &str) -> String {
         // the old one." the first "strike that" is ordinary content and
         // must be skipped in favor of the real "scratch that" marker later
         // in the string, rather than stopping the whole pass just because
-        // *a* match exists somewhere; (2) `is_genuine_marker` needs group
-        // 1's end (right after "that", before trailing-comma absorption),
-        // which a plain `find` over group 0 can't expose.
+        // *a* match exists somewhere; (2) `has_trailing_boundary` needs
+        // group 1's end (right after "that", before trailing-comma
+        // absorption), which a plain `find` over group 0 can't expose.
         let found = re.captures_iter(&out).find_map(|caps| {
             let whole = caps.get(0).expect("group 0 always present");
             let word = caps.get(1).expect("group 1 always present (not optional)");
-            is_genuine_marker(&out, whole.start(), word.end())
-                .then(|| (whole.start(), whole.end()))
+            has_trailing_boundary(&out, word.end()).then(|| (whole.start(), whole.end()))
         });
         let Some((match_start, match_end)) = found else {
             break;
@@ -303,13 +247,27 @@ mod tests {
         );
     }
 
+    /// Task E2 re-review finding: this test previously asserted that a
+    /// comma-less marker with a lowercase continuation ("Call them now
+    /// scratch that call them later.") still matched, via a since-removed
+    /// echo heuristic (`is_repeated_clause_verb`) that inferred intent from
+    /// the trailing word repeating the clause's own opening word. That
+    /// heuristic was overfit: it introduced a new false-positive deletion on
+    /// ordinary text ("Strike the tent then strike that strike the pegs
+    /// firmly." → wrongly destroyed "Strike the tent then") and still failed
+    /// to fire on realistic comma-less verb-changing corrections. Removing
+    /// it makes this exact input genuinely ambiguous — identical shape to
+    /// the "strike that clause from the contract" false positive, no comma,
+    /// no capital-letter continuation, no other trailing-boundary signal —
+    /// so it is now correctly left unrecognized. Kept (not deleted) as an
+    /// explicit "considered and intentionally not treated as a marker" case
+    /// per the module's false-negative-over-false-positive doctrine, rather
+    /// than being silently forgotten.
     #[test]
-    fn scratch_that_without_surrounding_commas_still_matches() {
-        // STT punctuation is inconsistent; the marker itself (not the
-        // commas) is what must be exact.
+    fn scratch_that_without_any_trailing_boundary_signal_is_not_recognized() {
         assert_eq!(
             apply_scratch_that("Call them now scratch that call them later."),
-            "Call them later."
+            "Call them now scratch that call them later."
         );
     }
 
@@ -334,10 +292,8 @@ mod tests {
     /// phrase rather than a self-correction interjection — silently
     /// destroying real dictated content (exactly the risk the module's own
     /// doc comment already warns about). Each case here is comma-less on
-    /// both sides of the marker, so `has_trailing_boundary` alone rejects
-    /// it (no comma/EOS/capital-letter/back-to-back-marker follows "that"),
-    /// and `is_repeated_clause_verb` also correctly declines to rescue it
-    /// (the word right after "that" doesn't echo the clause's opening word).
+    /// both sides of the marker, so `has_trailing_boundary` rejects it (no
+    /// comma/EOS/capital-letter/back-to-back-marker follows "that").
     #[test]
     fn scratch_that_does_not_fire_on_ordinary_verb_object_usage() {
         // The review's own exact repro: "strike that clause" is a normal
@@ -351,8 +307,7 @@ mod tests {
         // word "scratch": a bare imperative verb + demonstrative pronoun +
         // noun object, sentence-initial (no leading clause at all), no
         // comma anywhere. `has_trailing_boundary` rejects on the trailing
-        // side (" itch." is lowercase, no comma); there is no leading
-        // clause for `is_repeated_clause_verb` to echo against either.
+        // side (" itch." is lowercase, no comma).
         assert_eq!(apply_scratch_that("Scratch that itch."), "Scratch that itch.");
         // "I'll strike that off my list" — comma-less, "that" as object of
         // "strike" again, this time followed by a preposition rather than a
@@ -380,36 +335,94 @@ mod tests {
         );
     }
 
-    /// `is_repeated_clause_verb`'s echo fallback exists specifically for
-    /// comma-less markers whose trailing word repeats the containing
-    /// clause's own opening word (STT dropped the comma but transcribed the
-    /// words correctly) — confirms this generalizes past the one verb
-    /// ("call") the pre-existing
-    /// `scratch_that_without_surrounding_commas_still_matches` test uses,
-    /// so the fix isn't coincidentally keyed to that single word.
+    /// Task E2 re-review finding: previously verified that the since-removed
+    /// `is_repeated_clause_verb` echo fallback generalized past the single
+    /// verb ("call") the sibling
+    /// `scratch_that_without_any_trailing_boundary_signal_is_not_recognized`
+    /// test uses. With that fallback gone, this comma-less, lowercase-
+    /// continuation input ("email" after "that") has the same "no trailing
+    /// boundary signal" shape as every other ambiguous case in this module
+    /// and is now correctly left unrecognized rather than guessed at. Kept
+    /// as an explicit second data point (different repeated verb) for the
+    /// same "ambiguous, don't touch" behavior, not deleted.
     #[test]
-    fn scratch_that_echo_fallback_generalizes_to_other_repeated_verbs() {
+    fn scratch_that_without_trailing_boundary_generalizes_across_repeated_verbs() {
         assert_eq!(
             apply_scratch_that("Email Priya today scratch that email Priya tomorrow."),
-            "Email Priya tomorrow."
+            "Email Priya today scratch that email Priya tomorrow."
         );
     }
 
-    /// Regression guard for `is_repeated_clause_verb`'s
-    /// `clause_start >= marker_start` check: a marker sitting at the very
-    /// start of the string has no real preceding clause, so
-    /// `previous_boundary` returns 0 — the same value as `marker_start`
-    /// itself. Without the guard, `first_word_lowercased` at that shared
-    /// index would read the marker's *own* verb ("scratch") as the "clause
-    /// word", which would then spuriously match a same-word continuation
-    /// right after the marker and rescue a comma-less, trailing-boundary-less
-    /// match that is not a genuine self-correction (there is no earlier
-    /// clause to be correcting).
+    /// A marker at the very start of the string, immediately followed by a
+    /// lowercase word that happens to repeat the marker's own leading verb
+    /// ("Scratch that scratch pad..."): comma-less, no capital-letter
+    /// continuation, no EOS, no back-to-back marker, so `has_trailing_boundary`
+    /// rejects it like any other ambiguous comma-less case. Kept as a
+    /// dedicated regression case for this specific shape (marker's own verb
+    /// echoed immediately after it, at string start) since it was previously
+    /// the input a since-removed echo heuristic needed a special guard to
+    /// avoid misfiring on.
     #[test]
     fn scratch_that_at_string_start_does_not_echo_its_own_verb() {
         assert_eq!(
             apply_scratch_that("Scratch that scratch pad before you leave."),
             "Scratch that scratch pad before you leave."
+        );
+    }
+
+    /// Task E2 re-review finding (new false positive introduced by the since-
+    /// removed `is_repeated_clause_verb` echo fallback): the containing
+    /// clause opens with "Strike" and the word immediately after the second
+    /// "that" is "strike", so the old echo heuristic matched on the clause's
+    /// opening word alone — with no regard for grammatical role — and
+    /// wrongly rescued this as a marker, silently deleting "Strike the tent
+    /// then" from the output. This is ordinary text: "strike that" here
+    /// means "hit that [strike the pegs]", not a self-correction. With the
+    /// echo heuristic removed, this comma-less, lowercase-continuation
+    /// candidate now correctly fails `has_trailing_boundary` (no comma, no
+    /// capital letter, no EOS, no back-to-back marker after "that") and the
+    /// whole sentence is left unchanged.
+    #[test]
+    fn scratch_that_does_not_echo_match_an_unrelated_repeated_verb() {
+        assert_eq!(
+            apply_scratch_that("Strike the tent then strike that strike the pegs firmly."),
+            "Strike the tent then strike that strike the pegs firmly."
+        );
+    }
+
+    /// Second data point for the same since-removed echo-heuristic false
+    /// positive, with "scratch" instead of "strike" as the repeated word —
+    /// confirms the fix isn't narrowly tuned to only one of the two marker
+    /// verbs. "Scratch that scratch pad" is again ordinary text ("scratch
+    /// [that scratch pad]"), not a self-correction; must return unchanged.
+    #[test]
+    fn scratch_that_does_not_echo_match_an_unrelated_repeated_noun_modifier() {
+        assert_eq!(
+            apply_scratch_that("Scratch the itch then scratch that scratch pad quickly."),
+            "Scratch the itch then scratch that scratch pad quickly."
+        );
+    }
+
+    /// Documents an accepted trade-off, not a bug to chase: a comma-less
+    /// self-correction that changes the clause's *verb* ("Send" →
+    /// "deliver") has no trailing-boundary signal for `has_trailing_boundary`
+    /// to key off (no comma, no capital-letter continuation, no EOS, no
+    /// back-to-back marker after "that") and is therefore left uncorrected —
+    /// both clauses and the marker text remain in the output verbatim. This
+    /// is the direct cost of removing the echo heuristic: that heuristic
+    /// existed to catch shapes like this, but it did so unsafely (see
+    /// `scratch_that_does_not_echo_match_an_unrelated_repeated_verb` above)
+    /// and, per this exact case, still didn't even succeed at the goal — a
+    /// changed verb never echoes the clause's opening word, so the old
+    /// heuristic would have left this uncorrected too. Per the module's
+    /// documented doctrine (see module doc comment), a missed marker is
+    /// always preferable to a wrong deletion, so this remains unrecognized
+    /// rather than guessed at.
+    #[test]
+    fn scratch_that_leaves_comma_less_verb_changing_corrections_uncorrected() {
+        assert_eq!(
+            apply_scratch_that("Send it Monday scratch that deliver it Tuesday."),
+            "Send it Monday scratch that deliver it Tuesday."
         );
     }
 
