@@ -850,10 +850,14 @@ impl TranscriptionManager {
     /// (either the whole clip in the non-streaming path, or the joined
     /// segments + tail in the streaming path): custom-word correction ->
     /// filler-word/hallucination filtering -> spoken-number-to-digit
-    /// normalization -> personal memory-file corrections. Must run exactly
-    /// once on the fully joined text so corrections and filler-removal can't
-    /// behave differently at segment boundaries than they would on one
-    /// contiguous transcript.
+    /// normalization -> personal memory-file corrections -> voice-snippet
+    /// expansion. Must run exactly once on the fully joined text so
+    /// corrections and filler-removal can't behave differently at segment
+    /// boundaries than they would on one contiguous transcript. The
+    /// voice-snippet check is deliberately the LAST step and lives here
+    /// (not at either call site) so it stays exactly-once too: if the
+    /// corrected utterance matches a snippet trigger, this function returns
+    /// the pasted expansion in place of the literal words.
     fn post_stt_pipeline(&self, text: String, settings: &AppSettings) -> String {
         // Apply word correction if custom words are configured.
         // Skip for Whisper models since custom words are already passed as initial_prompt.
@@ -896,6 +900,23 @@ impl TranscriptionManager {
             &final_result,
             settings.h2_memory_file_path.as_deref(),
         );
+
+        // Voice snippets: if the WHOLE (corrected) utterance is exactly a
+        // trigger phrase in the memory file's "## Snippets" table, paste the
+        // pre-written block instead of the literal words. Deterministic,
+        // no-LLM, checked AFTER corrections so a mis-heard word in the
+        // trigger itself still resolves correctly. Reuses the same
+        // mtime/len-cached memory read `apply_from_memory_file` just used
+        // above — no second file read. Must stay the only snippet check in
+        // the pipeline so it runs exactly once per dictation, same as the
+        // corrections call above (see `post_stt_pipeline` doc comment).
+        if let Some(expansion) = crate::handy2::corrections::expand_snippet_from_memory_file(
+            &final_result,
+            settings.h2_memory_file_path.as_deref(),
+        ) {
+            info!("Transcription result: voice snippet expanded");
+            return expansion;
+        }
 
         if final_result.is_empty() {
             info!("Transcription result is empty");

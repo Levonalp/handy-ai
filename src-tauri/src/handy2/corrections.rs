@@ -147,25 +147,29 @@ struct CachedRules {
     mtime: SystemTime,
     len: u64,
     rules: Arc<Vec<CorrectionRule>>,
+    /// Raw memory text, kept alongside the pre-compiled rules so
+    /// `expand_snippet_from_memory_file` can scan the `## Snippets` table
+    /// without a second disk read. Snippet lookup is a cheap `lines()` scan
+    /// (no regex compiles), so unlike `rules` there is no need to pre-parse
+    /// it into its own cached structure — `expand_snippet` re-scans this
+    /// string on every call, and stays the single source of truth for
+    /// snippet-parsing logic (directly unit-tested, not duplicated here).
+    memory_text: Arc<String>,
 }
 
-static RULE_CACHE: OnceLock<Mutex<Option<CachedRules>>> = OnceLock::new();
+static RULE_CACHE: OnceLock<Mutex<Option<Arc<CachedRules>>>> = OnceLock::new();
 
-/// Entry point for the transcription pipeline. Live-edit semantics are kept
-/// (rules reload when the file's mtime or length changes) but the ~7ms
-/// parse + 32-regex compile is paid only on change, not per dictation.
-/// Unset/unreadable path ⇒ input returned unchanged.
-pub fn apply_from_memory_file(text: &str, path: Option<&str>) -> String {
-    let Some(path) = path else {
-        return text.to_string();
-    };
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) => {
-            log::debug!("corrections: memory file unreadable ({path}): {e}; skipping");
-            return text.to_string();
-        }
-    };
+/// Stat the memory file and, if the cache is stale (path/mtime/len changed),
+/// re-read + re-parse it. Returns the fresh-or-cached entry, or `None` if
+/// the path is unset or the file is unreadable. Shared by
+/// `apply_from_memory_file` and `expand_snippet_from_memory_file` so the
+/// file is read from disk at most once per change, regardless of which (or
+/// both) callers run in a given dictation.
+fn cached_memory(path: Option<&str>) -> Option<Arc<CachedRules>> {
+    let path = path?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| log::debug!("corrections: memory file unreadable ({path}): {e}; skipping"))
+        .ok()?;
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let len = meta.len();
 
@@ -180,22 +184,44 @@ pub fn apply_from_memory_file(text: &str, path: Option<&str>) -> String {
     if !fresh {
         match std::fs::read_to_string(path) {
             Ok(memory) => {
-                *guard = Some(CachedRules {
+                *guard = Some(Arc::new(CachedRules {
                     path: path.to_string(),
                     mtime,
                     len,
                     rules: Arc::new(parse_rules(&memory)),
-                });
+                    memory_text: Arc::new(memory),
+                }));
             }
             Err(e) => {
                 log::debug!("corrections: memory file unreadable ({path}): {e}; skipping");
-                return text.to_string();
+                return None;
             }
         }
     }
-    let rules = Arc::clone(&guard.as_ref().expect("cache populated above").rules);
-    drop(guard);
-    apply(text, &rules)
+    guard.as_ref().cloned()
+}
+
+/// Entry point for the transcription pipeline. Live-edit semantics are kept
+/// (rules reload when the file's mtime or length changes) but the ~7ms
+/// parse + 32-regex compile is paid only on change, not per dictation.
+/// Unset/unreadable path ⇒ input returned unchanged.
+pub fn apply_from_memory_file(text: &str, path: Option<&str>) -> String {
+    match cached_memory(path) {
+        Some(cached) => apply(text, &cached.rules),
+        None => text.to_string(),
+    }
+}
+
+/// Cache-aware entry point for voice-snippet expansion in the transcription
+/// pipeline: reuses the same mtime/len-checked cache as
+/// `apply_from_memory_file` (populated by whichever of the two runs first
+/// for a given dictation) instead of re-reading the memory file, then
+/// delegates to the pure, directly-tested `expand_snippet`. Unset/unreadable
+/// path ⇒ `None` (never fires), matching `apply_from_memory_file`'s
+/// no-op-on-missing-file behavior.
+pub fn expand_snippet_from_memory_file(text: &str, path: Option<&str>) -> Option<String> {
+    let cached = cached_memory(path)?;
+    expand_snippet(text, &cached.memory_text)
 }
 
 /// Memory text minus the table rows `apply` already handles (they are applied
@@ -219,6 +245,56 @@ const LLM_SECTION_ALLOWLIST: [&str; 4] = [
     "## Stock Phrases",
     "## Formatting & Style Rules",
 ];
+
+const SNIPPETS_SECTION_HEADER: &str = "## Snippets";
+
+/// Normalize an utterance for snippet-trigger comparison: trim, lowercase,
+/// strip one trailing `.`/`!`/`?`/`,`. Applied identically to the spoken text
+/// and to each trigger parsed from the table so "Insert approval stamp." and
+/// "insert approval stamp" compare equal.
+fn normalize_trigger(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(['.', '!', '?', ','])
+        .trim()
+        .to_lowercase()
+}
+
+/// Deterministic voice-snippet expansion: if the WHOLE utterance (after
+/// normalization) equals a trigger phrase in the memory file's `## Snippets`
+/// table, return the paired expansion verbatim (`<br>` becomes a real
+/// newline). No mid-text/substring firing — this is intentionally an
+/// all-or-nothing match so a snippet trigger can't accidentally fire inside
+/// a longer dictation. Pure function: no file I/O, no caching, so it is
+/// directly unit-testable against a literal memory string.
+pub fn expand_snippet(text: &str, memory: &str) -> Option<String> {
+    let target = normalize_trigger(text);
+    if target.is_empty() {
+        return None;
+    }
+    let mut in_section = false;
+    for line in memory.lines() {
+        if line.trim_start().starts_with("## ") {
+            in_section = line.trim_start().starts_with(SNIPPETS_SECTION_HEADER);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((say_cell, paste_cell)) = table_cells(line) else {
+            continue;
+        };
+        if is_separator_or_header(&say_cell, &paste_cell) {
+            continue;
+        }
+        if say_cell.eq_ignore_ascii_case("Say") && paste_cell.eq_ignore_ascii_case("Paste") {
+            continue;
+        }
+        if normalize_trigger(&say_cell) == target {
+            return Some(paste_cell.replace("<br>", "\n"));
+        }
+    }
+    None
+}
 
 /// The LLM prompt no longer carries the whole memory file: deterministic
 /// layers own vocabulary/spelling, and the wrap+example own the ROLE rules.
@@ -410,6 +486,98 @@ mod tests {
     }
 
     #[test]
+    fn snippet_expands_whole_utterance_only() {
+        let mem = "## Snippets\n| Say | Paste |\n|---|---|\n| insert approval stamp | Appraisal reviewed, value approved. |\n| insert signoff | Best,<br>Levon |\n";
+        assert_eq!(
+            expand_snippet("Insert approval stamp.", mem).as_deref(),
+            Some("Appraisal reviewed, value approved.")
+        );
+        assert_eq!(
+            expand_snippet("insert signoff", mem).as_deref(),
+            Some("Best,\nLevon")
+        );
+        assert_eq!(
+            expand_snippet("please insert approval stamp now", mem),
+            None
+        );
+    }
+
+    #[test]
+    fn snippet_partial_or_trailing_extra_words_do_not_fire() {
+        // Whole-utterance-only per the brief: a trigger that is only a
+        // *prefix* of what was said must not fire either (not just the
+        // "leading extra words" case the brief's own test covers).
+        let mem = "## Snippets\n| Say | Paste |\n|---|---|\n| insert signoff | Best,<br>Levon |\n";
+        assert_eq!(
+            expand_snippet("insert signoff please", mem),
+            None,
+            "trigger as a prefix of a longer utterance must not fire"
+        );
+        assert_eq!(
+            expand_snippet("insert signoff insert signoff", mem),
+            None,
+            "repeated trigger text must not fire (still not equal to the whole utterance)"
+        );
+    }
+
+    #[test]
+    fn snippet_trailing_punctuation_variants_all_normalize() {
+        let mem = "## Snippets\n| Say | Paste |\n|---|---|\n| insert proceed stamp | Appraisal is approved. Please proceed. |\n";
+        for spoken in [
+            "insert proceed stamp",
+            "insert proceed stamp.",
+            "insert proceed stamp!",
+            "insert proceed stamp?",
+            "insert proceed stamp,",
+            "  Insert Proceed Stamp  ",
+            "INSERT PROCEED STAMP.",
+        ] {
+            assert_eq!(
+                expand_snippet(spoken, mem).as_deref(),
+                Some("Appraisal is approved. Please proceed."),
+                "failed to normalize: {spoken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snippet_section_header_with_trailing_annotation_still_matches() {
+        // The real seeded handy-memory.md header is
+        // "## Snippets (say the phrase alone -> pastes the block verbatim)",
+        // not the bare "## Snippets" the brief's own test fixture uses.
+        // Section matching must use the same starts_with semantics as
+        // parse_rules/LLM_SECTION_ALLOWLIST, not exact equality.
+        let mem = "## Snippets (say the phrase alone \u{2192} pastes the block verbatim)\n\
+                   | Say | Paste |\n|---|---|\n\
+                   | insert signoff | Best,<br>Levon |\n";
+        assert_eq!(
+            expand_snippet("insert signoff", mem).as_deref(),
+            Some("Best,\nLevon")
+        );
+    }
+
+    #[test]
+    fn snippet_section_is_not_in_llm_allowlist() {
+        // Step 3 of the brief: '## Snippets' must NOT be exposed to the LLM
+        // prompt via slim_memory_for_llm — it is a deterministic-only layer.
+        let mem = "\
+## Dictation Corrections\n| Heard (wrong) | Write (right) |\n|---|---|\n| Powery | Bowery |\n\
+## Snippets (say the phrase alone -> pastes the block verbatim)\n\
+| Say | Paste |\n|---|---|\n| insert signoff | Best,<br>Levon |\n\
+## Number Rules\n- budget 140,000\n";
+        let slim = slim_memory_for_llm(mem);
+        assert!(
+            !slim.contains("Snippets"),
+            "Snippets section header leaked into the LLM prompt"
+        );
+        assert!(
+            !slim.contains("insert signoff"),
+            "Snippet trigger text leaked into the LLM prompt"
+        );
+        assert!(slim.contains("Number Rules"));
+    }
+
+    #[test]
     fn applies_against_the_real_memory_file_if_present() {
         let real = "C:/Users/lwsha/OneDrive/Desktop/Claude/Handy2.0/handy-memory.md";
         if let Ok(memory) = std::fs::read_to_string(real) {
@@ -424,6 +592,52 @@ mod tests {
                 "the Bowery appraisal"
             );
             assert_eq!(apply("check my sequel db", &rules), "check MySQL db");
+        }
+    }
+
+    #[test]
+    fn snippets_expand_against_the_real_memory_file_if_present() {
+        let real = "C:/Users/lwsha/OneDrive/Desktop/Claude/Handy2.0/handy-memory.md";
+        if let Ok(memory) = std::fs::read_to_string(real) {
+            // Pure function against the real seeded '## Snippets' table,
+            // including the trailing-punctuation/case normalization the
+            // dictation pipeline relies on.
+            assert_eq!(
+                expand_snippet("Insert approval stamp.", &memory).as_deref(),
+                Some("Appraisal reviewed, value approved.")
+            );
+            assert_eq!(
+                expand_snippet("insert value approved", &memory).as_deref(),
+                Some("Value reviewed and approved.")
+            );
+            assert_eq!(
+                expand_snippet("insert proceed stamp", &memory).as_deref(),
+                Some("Appraisal is approved. Please proceed.")
+            );
+            // Multi-line expansion: '<br>' in the table cell becomes a real
+            // newline in the pasted text.
+            assert_eq!(
+                expand_snippet("insert signoff", &memory).as_deref(),
+                Some("Best,\nLevon")
+            );
+            // Whole-utterance-only: extra words around the trigger must not
+            // fire, even against the real file's content.
+            assert_eq!(
+                expand_snippet("please insert approval stamp for this file", &memory),
+                None
+            );
+
+            // Cache-aware wrapper against the real path (not just the pure
+            // function against literal text) — this is what
+            // post_stt_pipeline actually calls.
+            assert_eq!(
+                expand_snippet_from_memory_file("insert signoff", Some(real)).as_deref(),
+                Some("Best,\nLevon")
+            );
+            assert_eq!(
+                expand_snippet_from_memory_file("not a snippet trigger at all", Some(real)),
+                None
+            );
         }
     }
 }
