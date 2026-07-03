@@ -15,7 +15,8 @@ pub mod routing;
 pub mod secrets;
 
 use crate::settings::AppSettings;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
+use std::time::Instant;
 
 const DICTATION_START: &str = "<<<DICTATION>>>";
 const DICTATION_END: &str = "<<<END>>>";
@@ -141,6 +142,7 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
 
     let cap = output_cap_for(&decision.cleaned_text);
 
+    let llm_start = Instant::now();
     match crate::llm_client::send_chat_completion_with_schema(
         &provider,
         api_key,
@@ -155,6 +157,8 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
     .await
     {
         Ok(Some(text)) if !text.trim().is_empty() => {
+            let llm_ms = llm_start.elapsed().as_millis() as u64;
+            info!("h2: llm {}ms (prefill est + gen)", llm_ms);
             let stripped = strip_reformat_markers(&text);
             if stripped.is_empty() {
                 // The model echoed only the wrapper markers with nothing in
@@ -180,10 +184,14 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
             }
         }
         Ok(_) => {
+            let llm_ms = llm_start.elapsed().as_millis() as u64;
+            info!("h2: llm {}ms (prefill est + gen)", llm_ms);
             error!("h2: empty completion");
             None
         }
         Err(e) => {
+            let llm_ms = llm_start.elapsed().as_millis() as u64;
+            info!("h2: llm {}ms (prefill est + gen)", llm_ms);
             error!("h2: LLM failed: {e}; pasting raw transcript");
             None
         }

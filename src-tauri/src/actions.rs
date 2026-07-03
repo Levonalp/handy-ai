@@ -13,7 +13,7 @@ use crate::utils::{
 };
 use crate::TranscriptionCoordinator;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -509,7 +509,6 @@ impl ShortcutAction for TranscribeAction {
         // Unregister the cancel shortcut when transcription stops
         shortcut::unregister_cancel_shortcut(app);
 
-        let stop_time = Instant::now();
         debug!("TranscribeAction::stop called for binding: {}", binding_id);
 
         let ah = app.clone();
@@ -531,6 +530,7 @@ impl ShortcutAction for TranscribeAction {
 
         tauri::async_runtime::spawn(async move {
             let _guard = FinishGuard(ah.clone());
+            let dictation_start = Instant::now();
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id
@@ -631,12 +631,20 @@ impl ShortcutAction for TranscribeAction {
                                 let ah_clone = ah.clone();
                                 let paste_time = Instant::now();
                                 let final_text = processed.final_text;
+                                let stt_ms = transcription_time.elapsed().as_millis() as u64;
                                 ah.run_on_main_thread(move || {
                                     match utils::paste(final_text, ah_clone.clone()) {
-                                        Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
-                                            paste_time.elapsed()
-                                        ),
+                                        Ok(()) => {
+                                            let paste_ms = paste_time.elapsed().as_millis() as u64;
+                                            let total_ms = dictation_start.elapsed().as_millis() as u64;
+                                            debug!(
+                                                "Text pasted successfully in {:?}",
+                                                paste_time.elapsed()
+                                            );
+                                            // Log: dictation: stop->paste <total>ms (stt <stt_ms>ms, llm <llm_ms>ms, paste <paste_ms>ms)
+                                            // Note: llm_ms is logged separately by h2::post_process if enabled
+                                            info!("dictation: stop->paste {}ms (stt {}ms, llm 0ms, paste {}ms)", total_ms, stt_ms, paste_ms);
+                                        },
                                         Err(e) => {
                                             error!("Failed to paste transcription: {}", e);
                                             let _ = ah_clone.emit("paste-error", ());
@@ -678,10 +686,7 @@ impl ShortcutAction for TranscribeAction {
             }
         });
 
-        debug!(
-            "TranscribeAction::stop completed in {:?}",
-            stop_time.elapsed()
-        );
+        debug!("TranscribeAction::stop initiated async transcription task");
     }
 }
 
