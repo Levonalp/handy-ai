@@ -345,6 +345,13 @@ pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    /// Wall-clock time of the h2 LLM call, in milliseconds. `Some(ms)` only
+    /// when `handy2::post_process` actually attempted an LLM call for this
+    /// dictation (h2 enabled and routing didn't short-circuit before the
+    /// call); `None` when no LLM call happened at all — h2 disabled, stock
+    /// post-processing used instead, or post-processing skipped entirely —
+    /// so the summary log can print an honest "n/a" instead of a fake 0ms.
+    pub llm_ms: Option<u64>,
 }
 
 pub(crate) async fn process_transcription_output(
@@ -356,6 +363,7 @@ pub(crate) async fn process_transcription_output(
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+    let mut llm_ms: Option<u64> = None;
 
     if let Some(converted_text) = maybe_convert_chinese_variant(&settings, transcription).await {
         final_text = converted_text;
@@ -365,7 +373,9 @@ pub(crate) async fn process_transcription_output(
         // Handy 2.0: when enabled, route through our hotword + memory pipeline;
         // otherwise use Handy's stock post-processing unchanged.
         let processed = if settings.h2_enabled {
-            crate::handy2::post_process(&settings, &final_text).await
+            let (text, ms) = crate::handy2::post_process(&settings, &final_text).await;
+            llm_ms = ms;
+            text
         } else {
             post_process_transcription(&settings, &final_text).await
         };
@@ -391,6 +401,7 @@ pub(crate) async fn process_transcription_output(
         final_text,
         post_processed_text,
         post_process_prompt,
+        llm_ms,
     }
 }
 
@@ -630,6 +641,7 @@ impl ShortcutAction for TranscribeAction {
                             } else {
                                 let ah_clone = ah.clone();
                                 let paste_time = Instant::now();
+                                let llm_ms = processed.llm_ms;
                                 let final_text = processed.final_text;
                                 let stt_ms = transcription_time.elapsed().as_millis() as u64;
                                 ah.run_on_main_thread(move || {
@@ -642,8 +654,13 @@ impl ShortcutAction for TranscribeAction {
                                                 paste_time.elapsed()
                                             );
                                             // Log: dictation: stop->paste <total>ms (stt <stt_ms>ms, llm <llm_ms>ms, paste <paste_ms>ms)
-                                            // Note: llm_ms is logged separately by h2::post_process if enabled
-                                            info!("dictation: stop->paste {}ms (stt {}ms, llm 0ms, paste {}ms)", total_ms, stt_ms, paste_ms);
+                                            // llm_ms is "n/a" when no LLM call was attempted (h2 disabled, or
+                                            // routing short-circuited before the call) rather than a fake 0ms.
+                                            let llm_ms_str = match llm_ms {
+                                                Some(ms) => format!("{}ms", ms),
+                                                None => "n/a".to_string(),
+                                            };
+                                            info!("dictation: stop->paste {}ms (stt {}ms, llm {}, paste {}ms)", total_ms, stt_ms, llm_ms_str, paste_ms);
                                         },
                                         Err(e) => {
                                             error!("Failed to paste transcription: {}", e);

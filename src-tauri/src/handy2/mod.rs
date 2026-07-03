@@ -87,12 +87,18 @@ fn output_resembles_input(input: &str, output: &str) -> bool {
 }
 
 /// v2 post-processing: route → memory → prompt → Ollama. Returns the formatted
-/// text, or `None` to fall back to the raw transcript (never lose dictation).
-pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option<String> {
+/// text (or `None` to fall back to the raw transcript — never lose dictation)
+/// alongside how long the LLM call took. The duration is `Some(ms)` whenever
+/// the LLM call was actually attempted — including guard-rejected, empty, and
+/// error outcomes, since the call still happened and its latency is real —
+/// and `None` only on the early-return paths before any LLM call starts
+/// (hotword-only utterance, provider preset missing, no API key), where there
+/// is genuinely no LLM duration to report.
+pub async fn post_process(settings: &AppSettings, transcription: &str) -> (Option<String>, Option<u64>) {
     let decision = routing::route(transcription, &settings.h2_routes);
     if decision.cleaned_text.is_empty() {
         debug!("h2: hotword-only utterance, nothing to format");
-        return None;
+        return (None, None);
     }
 
     let memory_contents = match memory::read(settings.h2_memory_file_path.as_deref()) {
@@ -129,14 +135,14 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
         Some(p) => p,
         None => {
             error!("h2: ollama provider preset missing");
-            return None;
+            return (None, None);
         }
     };
     let api_key = match secrets::get_key() {
         Ok(k) => k,
         Err(e) => {
             warn!("h2: {e}; pasting raw transcript");
-            return None;
+            return (None, None);
         }
     };
 
@@ -167,7 +173,7 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
                 // tokens into the focused app, so treat it the same as any
                 // other failed reformat: fall back to the raw transcript.
                 error!("h2: completion was only wrapper markers, no content");
-                None
+                (None, Some(llm_ms))
             } else if !output_resembles_input(&decision.cleaned_text, &stripped) {
                 // Defense-in-depth layer three: the wrap+markers (layer two)
                 // and few-shot example (layer one) still occasionally let a
@@ -178,22 +184,22 @@ pub async fn post_process(settings: &AppSettings, transcription: &str) -> Option
                 error!(
                     "h2: output failed similarity guard (answer-shaped); pasting raw transcript"
                 );
-                None
+                (None, Some(llm_ms))
             } else {
-                Some(stripped)
+                (Some(stripped), Some(llm_ms))
             }
         }
         Ok(_) => {
             let llm_ms = llm_start.elapsed().as_millis() as u64;
             info!("h2: llm {}ms (prefill est + gen)", llm_ms);
             error!("h2: empty completion");
-            None
+            (None, Some(llm_ms))
         }
         Err(e) => {
             let llm_ms = llm_start.elapsed().as_millis() as u64;
             info!("h2: llm {}ms (prefill est + gen)", llm_ms);
             error!("h2: LLM failed: {e}; pasting raw transcript");
-            None
+            (None, Some(llm_ms))
         }
     }
 }
@@ -284,5 +290,32 @@ mod tests {
             "Are you working?",
             "I'm ready and waiting. Let me know what you need assistance with."
         ));
+    }
+
+    /// Regression test for the Task A3 review finding: `post_process` must
+    /// report `None` for the LLM duration on paths where no LLM call was
+    /// ever attempted, not a fake `Some(0)` that a caller could mistake for
+    /// "the LLM ran and took 0ms." This exercises the hotword-only
+    /// early-return path (routing yields empty `cleaned_text`, so the
+    /// function returns before `Instant::now()` for the LLM call is even
+    /// taken) without touching the network, so it runs as a normal `cargo
+    /// test --lib` test rather than needing the `#[ignore]`d live_smoke
+    /// harness.
+    #[tokio::test]
+    async fn no_llm_call_attempted_reports_none_duration_not_zero() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.h2_enabled = true;
+        settings.h2_routes = crate::settings::default_h2_routes();
+        // "Polish command" alone (no content after the hotword) routes to
+        // the polish route but yields empty cleaned_text -> post_process's
+        // very first early return, before any LLM call is attempted.
+        let (text, llm_ms) = post_process(&settings, "Polish command").await;
+        assert_eq!(text, None, "hotword-only utterance should fall back to None");
+        assert_eq!(
+            llm_ms, None,
+            "no LLM call was attempted on this path, so the duration must be \
+             None (honest 'n/a'), not Some(0) or any other value implying a \
+             call happened"
+        );
     }
 }
