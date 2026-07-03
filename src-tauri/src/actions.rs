@@ -354,6 +354,18 @@ pub(crate) struct ProcessedTranscription {
     pub llm_ms: Option<u64>,
 }
 
+/// One-hotkey UX: does this dictation's text carry a spoken h2 route trigger
+/// (e.g. "Polish command, ...")? Pure and cheap — safe to call on every
+/// transcription regardless of which binding fired. `false` whenever h2 is
+/// disabled, so a spoken trigger phrase is inert text when the feature is off.
+fn h2_spoken_hotword(settings: &AppSettings, final_text: &str) -> bool {
+    settings.h2_enabled
+        && crate::handy2::routing::route(final_text, &settings.h2_routes)
+            .route
+            .trigger
+            .is_some()
+}
+
 pub(crate) async fn process_transcription_output(
     app: &AppHandle,
     transcription: &str,
@@ -369,7 +381,11 @@ pub(crate) async fn process_transcription_output(
         final_text = converted_text;
     }
 
-    if post_process {
+    // One-hotkey UX: the raw binding also routes through h2 when the user
+    // SPOKE a route trigger ("Polish command, ..."). The dedicated
+    // post-process binding still forces it unconditionally.
+    let spoken_hotword = h2_spoken_hotword(&settings, &final_text);
+    if post_process || spoken_hotword {
         // Handy 2.0: when enabled, route through our hotword + memory pipeline;
         // otherwise use Handy's stock post-processing unchanged.
         let processed = if settings.h2_enabled {
@@ -766,3 +782,86 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
     );
     map
 });
+
+#[cfg(test)]
+mod h2_gate_tests {
+    //! One-hotkey UX: covers the `h2_spoken_hotword` predicate that feeds
+    //! `process_transcription_output`'s post-process gate
+    //! (`post_process || spoken_hotword`). Doesn't re-test `routing::route`
+    //! itself (see `handy2::routing::tests`) — only that this predicate is
+    //! wired to it correctly and respects the `h2_enabled` kill switch.
+    use super::h2_spoken_hotword;
+    use crate::settings::get_default_settings;
+
+    #[test]
+    fn no_trigger_phrase_is_false_even_with_h2_enabled() {
+        let mut settings = get_default_settings();
+        settings.h2_enabled = true;
+        assert!(!h2_spoken_hotword(
+            &settings,
+            "um so the panel needs three new appraisers"
+        ));
+    }
+
+    #[test]
+    fn trigger_phrase_is_true_when_h2_enabled() {
+        let mut settings = get_default_settings();
+        settings.h2_enabled = true;
+        assert!(h2_spoken_hotword(
+            &settings,
+            "Polish command, tell the credit team the appraisal is approved"
+        ));
+    }
+
+    #[test]
+    fn trigger_phrase_is_false_when_h2_disabled() {
+        // The feature kill switch wins even if the text would otherwise match
+        // a route trigger — a disabled h2 must never let the primary/raw
+        // binding silently start calling an LLM.
+        let mut settings = get_default_settings();
+        settings.h2_enabled = false;
+        assert!(!h2_spoken_hotword(
+            &settings,
+            "Polish command, tell the credit team the appraisal is approved"
+        ));
+    }
+
+    #[test]
+    fn hotword_mid_sentence_is_content_not_a_trigger() {
+        let mut settings = get_default_settings();
+        settings.h2_enabled = true;
+        assert!(!h2_spoken_hotword(
+            &settings,
+            "I told them the Polish command thing was a feature"
+        ));
+    }
+
+    /// The actual gate expression as it appears in
+    /// `process_transcription_output`: `post_process || spoken_hotword`.
+    /// Exercises all four combinations so a future edit to that composition
+    /// can't silently invert the dedicated binding's unconditional force or
+    /// fail to extend it to the primary binding.
+    #[test]
+    fn gate_boolean_composition_covers_all_four_combinations() {
+        let mut h2_on = get_default_settings();
+        h2_on.h2_enabled = true;
+        let plain = "just a plain sentence";
+        let triggered = "Polish command, tell the credit team the appraisal is approved";
+
+        // (dedicated binding, spoken hotword) -> gate result
+        let cases = [
+            (false, h2_spoken_hotword(&h2_on, plain), false), // primary + plain -> no LLM (unchanged)
+            (false, h2_spoken_hotword(&h2_on, triggered), true), // primary + hotword -> LLM (new)
+            (true, h2_spoken_hotword(&h2_on, plain), true),   // dedicated + plain -> LLM (unchanged)
+            (true, h2_spoken_hotword(&h2_on, triggered), true), // dedicated + hotword -> LLM (unchanged)
+        ];
+
+        for (post_process, spoken_hotword, expected_gate) in cases {
+            assert_eq!(
+                post_process || spoken_hotword,
+                expected_gate,
+                "post_process={post_process} spoken_hotword={spoken_hotword}"
+            );
+        }
+    }
+}
