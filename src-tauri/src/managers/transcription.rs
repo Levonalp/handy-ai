@@ -1016,6 +1016,66 @@ impl TranscriptionManager {
                     }
                 };
 
+                // Acquire the session lock BEFORE draining the recorder, and
+                // hold it across the drain. This closes a data-loss race
+                // against `finalize_streaming` (Task A2 review finding I1):
+                // previously, `drain_recording` ran lock-free, so it could
+                // pull real already-captured samples out of the recorder's
+                // buffer (via `Cmd::Drain`'s `mem::take` — those samples are
+                // gone from the recorder the instant that call returns) and
+                // then lose the CPU before reaching `inner.lock()`. If
+                // `finalize_streaming` won that race, it would see
+                // `finalized == true` on this thread's post-lock re-check and
+                // return, leaving the drained batch stranded in a local
+                // variable — never folded into `carry`, never transcribed,
+                // and not covered by `tail` either (tail only reflects audio
+                // captured after the drain).
+                //
+                // Making "drain -> check finalized -> commit-or-bail" one
+                // atomic sequence under `inner`'s lock removes the gap:
+                //   - If finalize_streaming wins the lock race, it sets
+                //     `finalized = true` and proceeds against the session as
+                //     it stood at that moment. When this thread then gets the
+                //     lock, it sees `finalized == true` and returns WITHOUT
+                //     ever calling `drain_recording` — so it never removes
+                //     samples from the recorder's buffer in the first place.
+                //     Nothing is lost: `finalize_streaming` is always called
+                //     with `tail` already produced by a prior, completed
+                //     `stop_recording()` call (see actions.rs's stop handler,
+                //     which calls `rm.stop_recording()` to completion before
+                //     invoking `tm.finalize_streaming()` — the two never run
+                //     concurrently), so any audio still sitting in the
+                //     recorder at this point is exactly what `tail` already
+                //     contains.
+                //   - If this thread wins the lock race, it drains (now
+                //     inside the lock), commits the batch or updates `carry`,
+                //     and releases the lock; `finalize_streaming` then blocks
+                //     on the same lock and proceeds only after this
+                //     iteration's commit is fully visible.
+                //
+                // Lock ordering stays one-directional (`inner` -> recorder
+                // manager's internal locks, never the reverse): `drain_recording`
+                // only touches `AudioRecordingManager`'s own `state`/`recorder`
+                // locks internally, and nothing in `audio.rs` ever acquires a
+                // `StreamingSession.inner` lock, so no deadlock is possible.
+                // Holding `inner` across the drain briefly delays
+                // `finalize_streaming` if it's already blocked waiting for
+                // this same lock, but that's the correct/intended
+                // serialization (a channel round-trip to the recorder's
+                // worker thread — fast, not instant), not a new stall on
+                // anything else, since these two are the only two lock
+                // holders.
+                let mut inner = session.inner.lock().unwrap();
+
+                if session.finalized.load(Ordering::Acquire) {
+                    debug!(
+                        "Streaming poll thread: finalized before drain, exiting without draining \
+                         (finalize_streaming's tail already covers any audio left in the recorder)"
+                    );
+                    drop(inner);
+                    return;
+                }
+
                 let drained = match audio_mgr.drain_recording(&poll_binding_id) {
                     Some(d) => d,
                     None => {
@@ -1026,22 +1086,14 @@ impl TranscriptionManager {
                         // pick up (via the tail it's given directly, or an
                         // already-finalized session it will no-op against).
                         debug!("Streaming poll thread: recording no longer active, exiting");
+                        drop(inner);
                         return;
                     }
                 };
 
                 if drained.is_empty() {
-                    continue;
-                }
-
-                let mut inner = session.inner.lock().unwrap();
-
-                // Re-check after acquiring the lock: finalize_streaming may
-                // have run (and finished) while we were asleep/draining.
-                if session.finalized.load(Ordering::Acquire) {
-                    debug!("Streaming poll thread: finalized while draining, dropping this batch");
                     drop(inner);
-                    return;
+                    continue;
                 }
 
                 let mut buf = std::mem::take(&mut inner.carry);
@@ -1502,6 +1554,149 @@ mod streaming_tests {
 
         assert_eq!(buf, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         assert!(inner.carry.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Regression test for Task A2 review finding I1: a data-loss race
+    // between the poll thread's drain and `finalize_streaming`.
+    //
+    // The bug (pre-fix): the poll thread called `drain_recording` — which
+    // irrevocably removes samples from the recorder's buffer — BEFORE
+    // acquiring `session.inner`'s lock. If it was then descheduled and
+    // `finalize_streaming` acquired the lock first (setting `finalized` and
+    // reading `carry`), the poll thread would wake up, re-check `finalized`
+    // under the lock, see `true`, and return — silently discarding the
+    // batch it had already drained (it's a local variable at that point,
+    // never folded into `carry`, and outside `tail`'s coverage too).
+    //
+    // The fix: the drain now happens INSIDE the same `session.inner` lock
+    // that `finalize_streaming` takes to set `finalized`/read `carry`, so
+    // "drain -> check finalized -> commit" is one atomic sequence. This test
+    // exercises that exact sequence directly (bypassing the real recorder
+    // and AppHandle, which the poll thread cannot be driven through in a
+    // unit test — see the integration test below for why) using a
+    // `Barrier` to force both competing code paths to race for the lock at
+    // the same instant on every iteration, rather than relying on sleep
+    // timing (inherently flaky to assert on). Because the OS scheduler's
+    // choice of lock winner is not itself controlled, the test repeats the
+    // race many times so both orderings (poll-wins / finalize-wins) are
+    // very likely to occur across the run; the assertion holds for either
+    // ordering, which is the actual invariant that matters — not "the poll
+    // thread must win" or "finalize must win," but "no drained sample is
+    // ever unaccounted for no matter which one wins."
+    #[test]
+    fn drain_and_finalize_race_never_loses_a_drained_batch() {
+        use std::sync::Barrier;
+
+        const ITERATIONS: usize = 200;
+
+        for i in 0..ITERATIONS {
+            let session = Arc::new(StreamingSession {
+                inner: Mutex::new(StreamingSessionInner {
+                    segments: Vec::new(),
+                    carry: vec![0.1, 0.2], // pre-existing carry, like a real session mid-flight
+                }),
+                finalized: AtomicBool::new(false),
+            });
+
+            // The batch a "drain" would irrevocably pull out of the
+            // recorder's buffer this iteration. Distinct per-iteration
+            // values so a mixed-up/duplicated batch would be detectable,
+            // though the primary assertion below is presence-or-never-taken.
+            let drained_batch = vec![1.0 + i as f32, 2.0 + i as f32, 3.0 + i as f32];
+            // Tracks whether the "drain" stand-in was ever actually invoked
+            // this iteration, mirroring the real `drain_recording` call
+            // that — once made — cannot be undone (the samples are gone
+            // from the recorder's buffer the instant it returns).
+            let drain_was_called = Arc::new(AtomicBool::new(false));
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            // Poll-thread stand-in: reproduces the exact fixed sequence from
+            // `begin_streaming`'s loop body — acquire `inner.lock()` first,
+            // check `finalized`, and only THEN "drain" (irrevocably) and
+            // fold the result into `carry`.
+            let poll_session = session.clone();
+            let poll_barrier = barrier.clone();
+            let poll_drained = drained_batch.clone();
+            let poll_drain_called = drain_was_called.clone();
+            let poll_thread = thread::spawn(move || {
+                poll_barrier.wait();
+                let mut inner = poll_session.inner.lock().unwrap();
+                if poll_session.finalized.load(Ordering::Acquire) {
+                    // Must exit WITHOUT ever "draining" — this is the crux
+                    // of the fix: no drain call means no samples were ever
+                    // removed from the recorder's buffer in the first
+                    // place, so there is nothing to lose.
+                    return;
+                }
+                // "Drain": irrevocable, mirrors `drain_recording` returning
+                // real captured samples that no longer exist anywhere else.
+                poll_drain_called.store(true, Ordering::SeqCst);
+                let mut buf = std::mem::take(&mut inner.carry);
+                buf.extend(poll_drained);
+                // No silence cut found this iteration (simplification for
+                // this test) -> whole batch becomes the new carry, exactly
+                // like the `_ => inner.carry = buf` arm in production.
+                inner.carry = buf;
+            });
+
+            // finalize_streaming stand-in: acquire the same lock, set
+            // `finalized`, and "commit" whatever carry it sees.
+            let fin_session = session.clone();
+            let fin_barrier = barrier.clone();
+            let finalize_thread = thread::spawn(move || {
+                fin_barrier.wait();
+                let mut inner = fin_session.inner.lock().unwrap();
+                fin_session.finalized.store(true, Ordering::Release);
+                // "Commit": in the real code this is `final_audio = carry +
+                // tail`; here we just fold carry into segments so we can
+                // assert on total sample count afterward.
+                let committed: Vec<f32> = std::mem::take(&mut inner.carry);
+                inner.segments.push(format!("{}", committed.len()));
+            });
+
+            poll_thread.join().expect("poll stand-in thread panicked");
+            finalize_thread
+                .join()
+                .expect("finalize stand-in thread panicked");
+
+            // The invariant: EITHER the drain was never called (poll thread
+            // saw finalized==true before draining -> nothing was ever
+            // removed from "the recorder," nothing to account for), OR it
+            // was called and its samples are now present in `carry` or
+            // already folded into a committed segment. What must NEVER
+            // happen: drain_was_called == true AND the batch is nowhere —
+            // that's exactly the bug (a drained-but-orphaned local
+            // variable). We verify this via total sample count: the
+            // pre-existing carry (2 samples) plus, if-and-only-if the drain
+            // stand-in ran, the 3 drained samples, must equal the sum of
+            // whatever's left in `carry` plus whatever got committed into
+            // `segments`.
+            let inner = session.inner.lock().unwrap();
+            let remaining_carry_len = inner.carry.len();
+            let committed_len: usize = inner
+                .segments
+                .iter()
+                .map(|s| s.parse::<usize>().unwrap())
+                .sum();
+            drop(inner);
+
+            let expected_total = 2 + if drain_was_called.load(Ordering::SeqCst) {
+                3
+            } else {
+                0
+            };
+            assert_eq!(
+                remaining_carry_len + committed_len,
+                expected_total,
+                "iteration {i}: samples lost across the drain/finalize race \
+                 (drain_was_called={}, remaining_carry={}, committed={})",
+                drain_was_called.load(Ordering::SeqCst),
+                remaining_carry_len,
+                committed_len,
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
