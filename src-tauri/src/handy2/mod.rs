@@ -12,6 +12,7 @@ mod live_smoke;
 pub mod memory;
 pub mod prompt;
 pub mod routing;
+pub mod scratch;
 pub mod secrets;
 
 use crate::settings::AppSettings;

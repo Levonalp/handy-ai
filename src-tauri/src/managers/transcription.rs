@@ -849,15 +849,15 @@ impl TranscriptionManager {
     /// The deterministic, offline text pipeline applied to a FINAL transcript
     /// (either the whole clip in the non-streaming path, or the joined
     /// segments + tail in the streaming path): custom-word correction ->
-    /// filler-word/hallucination filtering -> spoken-number-to-digit
-    /// normalization -> personal memory-file corrections -> voice-snippet
-    /// expansion. Must run exactly once on the fully joined text so
-    /// corrections and filler-removal can't behave differently at segment
-    /// boundaries than they would on one contiguous transcript. The
-    /// voice-snippet check is deliberately the LAST step and lives here
-    /// (not at either call site) so it stays exactly-once too: if the
-    /// corrected utterance matches a snippet trigger, this function returns
-    /// the pasted expansion in place of the literal words.
+    /// filler-word/hallucination filtering -> "scratch that" self-correction
+    /// -> spoken-number-to-digit normalization -> personal memory-file
+    /// corrections -> voice-snippet expansion. Must run exactly once on the
+    /// fully joined text so corrections and filler-removal can't behave
+    /// differently at segment boundaries than they would on one contiguous
+    /// transcript. The voice-snippet check is deliberately the LAST step and
+    /// lives here (not at either call site) so it stays exactly-once too: if
+    /// the corrected utterance matches a snippet trigger, this function
+    /// returns the pasted expansion in place of the literal words.
     fn post_stt_pipeline(&self, text: String, settings: &AppSettings) -> String {
         // Apply word correction if custom words are configured.
         // Skip for Whisper models since custom words are already passed as initial_prompt.
@@ -884,12 +884,19 @@ impl TranscriptionManager {
             &settings.custom_filler_words,
         );
 
+        // Live self-corrections: "send it Monday, scratch that, send it
+        // Tuesday" drops the abandoned clause and the marker itself.
+        // Deterministic, offline, no LLM. Runs before ITN/corrections so a
+        // scratched-out clause's words (which might otherwise get digit- or
+        // vocabulary-corrected) never reach those later steps at all.
+        let scratched_result = crate::handy2::scratch::apply_scratch_that(&filtered_result);
+
         // Convert spoken numbers to digits ("twenty three" -> "23") for English.
         // Deterministic + offline, so the fast default path stays fast (no LLM).
         let final_result = if settings.app_language.to_lowercase().starts_with("en") {
-            words_to_digits(&filtered_result)
+            words_to_digits(&scratched_result)
         } else {
-            filtered_result
+            scratched_result
         };
 
         // Deterministic vocabulary corrections from the personal memory file

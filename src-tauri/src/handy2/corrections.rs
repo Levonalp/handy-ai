@@ -110,7 +110,10 @@ fn sentence_initial(text: &str, start: usize) -> bool {
     matches!(last, None | Some('.' | '!' | '?' | '…' | '\n' | '\r'))
 }
 
-fn capitalize_first(s: &str) -> String {
+/// `pub(crate)` (not private) so `handy2::scratch` can reuse the same
+/// sentence-initial capitalization semantics after splicing text at a
+/// deletion boundary, instead of duplicating this trivial logic.
+pub(crate) fn capitalize_first(s: &str) -> String {
     let mut cs = s.chars();
     match cs.next() {
         Some(f) => f.to_uppercase().collect::<String>() + cs.as_str(),
