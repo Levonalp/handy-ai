@@ -22,6 +22,11 @@ use crate::audio_toolkit::{
 enum Cmd {
     Start,
     Stop(mpsc::Sender<Vec<f32>>),
+    /// Like `Stop`'s buffer handoff, but capture is NOT ended: the consumer
+    /// keeps resampling/VAD-gating incoming audio into a fresh buffer after
+    /// replying. Used for segment-streaming so a background poll can pull
+    /// samples-so-far without interrupting the in-progress recording.
+    Drain(mpsc::Sender<Vec<f32>>),
     Shutdown,
 }
 
@@ -204,8 +209,26 @@ impl AudioRecorder {
 
     pub fn stop(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let (resp_tx, resp_rx) = mpsc::channel();
-        if let Some(tx) = &self.cmd_tx {
-            tx.send(Cmd::Stop(resp_tx))?;
+        match &self.cmd_tx {
+            Some(tx) => tx.send(Cmd::Stop(resp_tx))?,
+            // Worker already shut down (close() ran concurrently) — nothing
+            // will ever reply, so return instead of blocking forever on recv().
+            None => return Ok(Vec::new()),
+        }
+        Ok(resp_rx.recv()?) // wait for the samples
+    }
+
+    /// Return samples buffered so far and clear the buffer; capture continues
+    /// uninterrupted. Used by segment-streaming to pull audio mid-recording.
+    pub fn drain(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        match &self.cmd_tx {
+            Some(tx) => tx.send(Cmd::Drain(resp_tx))?,
+            // Worker already shut down (close() ran concurrently, e.g. the
+            // recording was stopped between this call's state check and the
+            // recorder lock) — nothing will ever reply, so return instead of
+            // blocking forever on recv().
+            None => return Ok(Vec::new()),
         }
         Ok(resp_rx.recv()?) // wait for the samples
     }
@@ -508,6 +531,15 @@ fn run_consumer(
                     // Resume the audio callback so the consumer loop can continue
                     // receiving chunks (important for always-on microphone mode).
                     stop_flag.store(false, Ordering::Relaxed);
+                }
+                Cmd::Drain(reply_tx) => {
+                    // Hand off everything accumulated so far and keep recording.
+                    // Unlike Stop, capture is never paused: no stop_flag toggle,
+                    // no EndOfStream wait, no resampler finish() (that would
+                    // flush a partial frame prematurely). The frame_resampler's
+                    // internal partial-frame tail is left untouched so it keeps
+                    // accumulating correctly across the drain boundary.
+                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
                 }
                 Cmd::Shutdown => {
                     stop_flag.store(true, Ordering::Relaxed);

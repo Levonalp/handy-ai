@@ -468,6 +468,14 @@ impl ShortcutAction for TranscribeAction {
         if recording_error.is_none() {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
+
+            // Segment-streaming: transcribe audio in the background WHILE the
+            // user keeps talking, so most of the transcript already exists
+            // by the time they release the key. No-op (falls back to the
+            // normal single-shot transcribe() at stop time) if disabled.
+            if settings.streaming_enabled {
+                tm.begin_streaming(app.clone(), binding_id.clone());
+            }
         } else {
             // Starting failed (for example due to blocked microphone permissions).
             // Revert UI state so we don't stay stuck in the recording overlay.
@@ -551,9 +559,18 @@ impl ShortcutAction for TranscribeAction {
                         crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
                     });
 
-                    // Transcribe concurrently with WAV save
+                    // Transcribe concurrently with WAV save.
+                    //
+                    // finalize_streaming() transcribes only the small leftover
+                    // tail (everything already covered by prior segments was
+                    // transcribed in the background while the user was still
+                    // talking) — that's the whole point of segment-streaming.
+                    // It falls back to the normal single-shot transcribe()
+                    // internally whenever no session exists for this binding
+                    // (streaming disabled, or begin_streaming didn't start one),
+                    // so this call site doesn't need to re-check the setting.
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe(samples);
+                    let transcription_result = tm.finalize_streaming(&binding_id, samples);
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {

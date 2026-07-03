@@ -482,6 +482,43 @@ impl AudioRecordingManager {
             _ => None,
         }
     }
+
+    /// Pull samples buffered so far for an in-progress recording without
+    /// stopping it — no extra-recording-buffer sleep, no mic close/lazy-close,
+    /// no short-clip padding (all of those are stop-only concerns; the
+    /// recording is still live after this returns). Used by segment-streaming
+    /// to poll audio mid-recording for background transcription.
+    ///
+    /// Returns `None` if `binding_id` isn't the currently active recording
+    /// (covers both the idle case and a stale/mismatched binding — e.g. a
+    /// poll thread from a previous recording that hasn't noticed yet).
+    pub fn drain_recording(&self, binding_id: &str) -> Option<Vec<f32>> {
+        let state = self.state.lock().unwrap();
+
+        match *state {
+            RecordingState::Recording {
+                binding_id: ref active,
+            } if active == binding_id => {
+                drop(state);
+
+                match self.recorder.lock().unwrap().as_ref() {
+                    Some(rec) => match rec.drain() {
+                        Ok(buf) => Some(buf),
+                        Err(e) => {
+                            error!("drain() failed: {e}");
+                            None
+                        }
+                    },
+                    None => {
+                        error!("Recorder not available");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_recording(&self) -> bool {
         matches!(
             *self.state.lock().unwrap(),

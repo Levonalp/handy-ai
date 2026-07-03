@@ -449,6 +449,16 @@ pub struct AppSettings {
     pub whisper_gpu_device: i32,
     #[serde(default)]
     pub extra_recording_buffer_ms: u64,
+    /// Transcribe audio segments in the background WHILE the user is still
+    /// speaking (cut at VAD-detected pauses), instead of waiting for the key
+    /// release to transcribe the whole clip. Escape hatch back to the old
+    /// whole-clip-on-release behavior if streaming ever misbehaves.
+    #[serde(default = "default_true")]
+    pub streaming_enabled: bool,
+    /// Minimum confirmed silence, in milliseconds, before segment-streaming
+    /// will cut and transcribe the audio before that pause.
+    #[serde(default = "default_streaming_min_silence_ms")]
+    pub streaming_min_silence_ms: u64,
 }
 
 fn default_model() -> String {
@@ -713,6 +723,14 @@ fn default_whisper_gpu_device() -> i32 {
     -1 // auto
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_streaming_min_silence_ms() -> u64 {
+    500
+}
+
 fn default_typing_tool() -> TypingTool {
     TypingTool::Auto
 }
@@ -880,6 +898,8 @@ pub fn get_default_settings() -> AppSettings {
         ort_accelerator: OrtAcceleratorSetting::default(),
         whisper_gpu_device: default_whisper_gpu_device(),
         extra_recording_buffer_ms: 0,
+        streaming_enabled: default_true(),
+        streaming_min_silence_ms: default_streaming_min_silence_ms(),
     }
 }
 
