@@ -6,6 +6,7 @@
 //! against Handy's existing `llm_client` and is invoked from `actions.rs`
 //! only when `settings.h2_enabled` is true.
 
+pub mod app_context;
 pub mod corrections;
 #[cfg(test)]
 mod live_smoke;

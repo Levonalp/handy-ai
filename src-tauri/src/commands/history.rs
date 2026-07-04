@@ -93,8 +93,13 @@ pub async fn retry_history_entry_transcription(
         return Err("Recording contains no speech".to_string());
     }
 
+    // Re-transcribing from a saved history entry has no meaningful
+    // capture-time foreground app (recording start happened in a past
+    // session, possibly minutes/hours ago) — pass None so the verbatim-app
+    // gate simply doesn't apply here and normal routing proceeds.
     let processed =
-        process_transcription_output(&app, &transcription, entry.post_process_requested).await;
+        process_transcription_output(&app, &transcription, entry.post_process_requested, None)
+            .await;
     history_manager
         .update_transcription(
             id,

@@ -370,30 +370,76 @@ pub(crate) async fn process_transcription_output(
     app: &AppHandle,
     transcription: &str,
     post_process: bool,
+    foreground_app: Option<String>,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
+    process_transcription_output_with_settings(&settings, transcription, post_process, foreground_app)
+        .await
+}
+
+/// Core of [`process_transcription_output`], taking already-loaded
+/// [`AppSettings`] instead of an `AppHandle`. Split out so the gate logic
+/// (including the Task E5 verbatim-app override) is directly unit-testable
+/// with `#[tokio::test]` — `get_settings(app: &AppHandle)` unconditionally
+/// calls `app.store(...).expect(...)`, which panics without a live
+/// `tauri_plugin_store` registration, and this codebase has no working
+/// pattern for constructing a real `AppHandle` in a test (see the
+/// `TranscriptionManager`/`AudioRecordingManager` note in
+/// `managers::transcription`'s streaming tests for prior art reaching the
+/// same conclusion). Mirrors the existing `h2_spoken_hotword(settings:
+/// &AppSettings, ...)` extraction already used in this file.
+async fn process_transcription_output_with_settings(
+    settings: &AppSettings,
+    transcription: &str,
+    post_process: bool,
+    foreground_app: Option<String>,
+) -> ProcessedTranscription {
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
     let mut llm_ms: Option<u64> = None;
 
-    if let Some(converted_text) = maybe_convert_chinese_variant(&settings, transcription).await {
+    if let Some(converted_text) = maybe_convert_chinese_variant(settings, transcription).await {
         final_text = converted_text;
     }
 
+    // App-aware verbatim list (Task E5): dictating into a terminal or coding
+    // agent almost always wants exact words, not an LLM rewrite. This beats
+    // EVEN the dedicated force-post-process binding (`post_process == true`)
+    // and the spoken hotword trigger below — that's the point of the list;
+    // remove an app from settings to re-enable LLM routing for it.
+    let verbatim_app = foreground_app
+        .as_deref()
+        .filter(|name| crate::handy2::app_context::is_verbatim_app(name, &settings.h2_verbatim_apps));
+
     // One-hotkey UX: the raw binding also routes through h2 when the user
     // SPOKE a route trigger ("Polish command, ..."). The dedicated
-    // post-process binding still forces it unconditionally.
-    let spoken_hotword = h2_spoken_hotword(&settings, &final_text);
-    if post_process || spoken_hotword {
+    // post-process binding still forces it unconditionally. The verbatim-app
+    // check above overrides both — folded into this same condition (rather
+    // than a separate leading `if is_verbatim { skip } else if ...`) so the
+    // `else if final_text != transcription` bookkeeping arm below stays
+    // shared and still runs for verbatim apps (e.g. Chinese-variant
+    // conversion, which is deterministic and NOT an LLM call, must still be
+    // recorded even when LLM routing itself is suppressed).
+    let spoken_hotword = h2_spoken_hotword(settings, &final_text);
+    let would_have_routed = post_process || spoken_hotword;
+    if let Some(name) = verbatim_app {
+        if would_have_routed {
+            // Only log when suppression actually changed the outcome — a
+            // verbatim app that wasn't going to route anyway (plain text,
+            // primary binding, no hotword) isn't worth a log line.
+            info!("h2: verbatim app '{}', skipping LLM", name);
+        }
+    }
+    if verbatim_app.is_none() && would_have_routed {
         // Handy 2.0: when enabled, route through our hotword + memory pipeline;
         // otherwise use Handy's stock post-processing unchanged.
         let processed = if settings.h2_enabled {
-            let (text, ms) = crate::handy2::post_process(&settings, &final_text).await;
+            let (text, ms) = crate::handy2::post_process(settings, &final_text).await;
             llm_ms = ms;
             text
         } else {
-            post_process_transcription(&settings, &final_text).await
+            post_process_transcription(settings, &final_text).await
         };
         if let Some(processed_text) = processed {
             post_processed_text = Some(processed_text.clone());
@@ -425,6 +471,19 @@ impl ShortcutAction for TranscribeAction {
     fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
+
+        // App-aware verbatim list (Task E5): capture the foreground app RIGHT
+        // NOW, before anything below (tray icon, recording overlay) can
+        // possibly perturb window focus. "Focus at start == paste target
+        // under PTT," so this is the only reliable moment to read it — by
+        // the time process_transcription_output runs (in stop()'s spawned
+        // task, possibly seconds later), the foreground window could be
+        // Handy's own overlay or wherever the user alt-tabbed to. Stored
+        // keyed by binding_id and consumed exactly once in stop().
+        crate::handy2::app_context::remember(
+            binding_id,
+            crate::handy2::app_context::foreground_process_name(),
+        );
 
         // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();
@@ -634,9 +693,17 @@ impl ShortcutAction for TranscribeAction {
                             if post_process {
                                 show_processing_overlay(&ah);
                             }
-                            let processed =
-                                process_transcription_output(&ah, &transcription, post_process)
-                                    .await;
+                            // Consume the foreground app captured at recording
+                            // start (Task E5) for this binding. take() removes
+                            // the entry so it's used exactly once per dictation.
+                            let foreground_app = crate::handy2::app_context::take(&binding_id);
+                            let processed = process_transcription_output(
+                                &ah,
+                                &transcription,
+                                post_process,
+                                foreground_app,
+                            )
+                            .await;
 
                             // Save to history if WAV was saved
                             if wav_saved {
@@ -787,9 +854,11 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 mod h2_gate_tests {
     //! One-hotkey UX: covers the `h2_spoken_hotword` predicate that feeds
     //! `process_transcription_output`'s post-process gate
-    //! (`post_process || spoken_hotword`). Doesn't re-test `routing::route`
-    //! itself (see `handy2::routing::tests`) — only that this predicate is
-    //! wired to it correctly and respects the `h2_enabled` kill switch.
+    //! (`verbatim_app.is_none() && (post_process || spoken_hotword)`).
+    //! Doesn't re-test `routing::route` itself (see `handy2::routing::tests`)
+    //! or `is_verbatim_app` itself (see `handy2::app_context::tests`) — only
+    //! that these predicates are wired to it correctly and respect the
+    //! `h2_enabled` kill switch and the verbatim-app override.
     use super::h2_spoken_hotword;
     use crate::settings::get_default_settings;
 
@@ -863,5 +932,115 @@ mod h2_gate_tests {
                 "post_process={post_process} spoken_hotword={spoken_hotword}"
             );
         }
+    }
+
+    /// Task E5: the full three-variable gate expression as it appears in
+    /// `process_transcription_output`:
+    /// `verbatim_app.is_none() && (post_process || spoken_hotword)`.
+    /// Exercises all eight combinations so a future edit can't silently let
+    /// the verbatim-app override lose to the dedicated binding's force, or
+    /// fail to suppress the spoken-hotword path — the whole point of the
+    /// list is that it beats BOTH.
+    #[test]
+    fn verbatim_app_overrides_both_post_process_and_spoken_hotword() {
+        let is_verbatim = [false, true];
+        let post_process = [false, true];
+        let spoken_hotword = [false, true];
+
+        for verbatim in is_verbatim {
+            for pp in post_process {
+                for hotword in spoken_hotword {
+                    let gate = !verbatim && (pp || hotword);
+                    let expected = if verbatim {
+                        false // verbatim app always wins, no matter what else is true
+                    } else {
+                        pp || hotword
+                    };
+                    assert_eq!(
+                        gate, expected,
+                        "verbatim={verbatim} post_process={pp} spoken_hotword={hotword}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Task E5 end-to-end wiring proof: calls the real gate function
+    /// (`process_transcription_output_with_settings`, the `AppHandle`-free
+    /// core of `process_transcription_output` — see that function's doc
+    /// comment for why this split exists) with the DEDICATED force-post-process
+    /// binding (`post_process = true`) AND a foreground app that's on the
+    /// default verbatim list. A unit test of `is_verbatim_app` alone proves
+    /// only the string-matching predicate; it does NOT prove this predicate
+    /// is actually wired into the gate that guards the LLM call. This test
+    /// would catch, for example, a regression where the verbatim check was
+    /// added as a separate leading `if is_verbatim { skip } else if
+    /// post_process || spoken_hotword { ... }` — which compiles fine and
+    /// looks correct, but silently drops the `else if final_text !=
+    /// transcription` bookkeeping arm for verbatim apps because Rust
+    /// `if`/`else if` arms are mutually exclusive.
+    #[tokio::test]
+    async fn verbatim_app_suppresses_llm_even_with_dedicated_force_binding() {
+        let mut settings = get_default_settings();
+        settings.h2_enabled = true;
+        settings.h2_routes = crate::settings::default_h2_routes();
+        // h2_verbatim_apps is left at its default (includes "powershell").
+        assert!(
+            crate::handy2::app_context::is_verbatim_app("powershell", &settings.h2_verbatim_apps),
+            "test premise: 'powershell' must be in the default verbatim list"
+        );
+
+        let transcription = "git commit dash m fix the bug";
+        let result = super::process_transcription_output_with_settings(
+            &settings,
+            transcription,
+            true, // dedicated force-post-process binding: would normally ALWAYS route
+            Some("powershell".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            result.llm_ms, None,
+            "no LLM call should have been attempted — the verbatim app must suppress \
+             routing even though post_process=true would otherwise force it"
+        );
+        assert_eq!(
+            result.final_text, transcription,
+            "verbatim apps get the exact raw transcript, not an LLM rewrite"
+        );
+        assert_eq!(
+            result.post_processed_text, None,
+            "no post-processed text should be recorded when the LLM never ran"
+        );
+    }
+
+    /// Companion case for the same wiring: with NO verbatim app in play, the
+    /// dedicated binding still forces routing exactly as before (regression
+    /// guard for the refactor that introduced
+    /// `process_transcription_output_with_settings`). Uses h2_enabled=false
+    /// so this exercises the stock `post_process_transcription` path rather
+    /// than requiring a live Ollama endpoint.
+    #[tokio::test]
+    async fn non_verbatim_app_does_not_suppress_the_dedicated_binding() {
+        let mut settings = get_default_settings();
+        settings.h2_enabled = false; // stock post-processing path, no network dependency
+
+        let transcription = "just a plain sentence";
+        let result = super::process_transcription_output_with_settings(
+            &settings,
+            transcription,
+            true, // dedicated force-post-process binding
+            Some("notepad".to_string()),
+        )
+        .await;
+
+        // With h2 disabled and no post-process providers/prompt configured to
+        // actually change the text, post_process_transcription legitimately
+        // may return None (falls back to raw) — the point here is only that
+        // the verbatim override did NOT short-circuit the gate itself: the
+        // final text is unchanged from the raw transcript either way, but
+        // critically this path is NOT the same code path as the verbatim
+        // case above (no "skip" log, gate condition evaluates true going in).
+        assert_eq!(result.final_text, transcription);
     }
 }

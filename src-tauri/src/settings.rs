@@ -420,6 +420,14 @@ pub struct AppSettings {
     pub h2_memory_file_path: Option<String>,
     #[serde(default = "default_h2_routes")]
     pub h2_routes: Vec<Route>,
+    /// App-aware verbatim list: case-insensitive substring match against the
+    /// foreground app's exe stem at RECORDING START. A match suppresses h2
+    /// LLM routing entirely for that dictation — beating even the dedicated
+    /// force-post-process binding — because dictating into a terminal or
+    /// coding agent almost always wants exact words, not a rewrite. Remove
+    /// an app from this list to re-enable LLM routing for it.
+    #[serde(default = "default_h2_verbatim_apps")]
+    pub h2_verbatim_apps: Vec<String>,
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
@@ -583,6 +591,22 @@ pub fn default_h2_routes() -> Vec<Route> {
             ollama_model: "qwen2.5:3b-instruct".to_string(),
             prompt_addendum: None,
         },
+    ]
+}
+
+/// Default app-aware verbatim list (Task E5): terminals and coding agents
+/// where dictation should never be LLM-rewritten. Matched case-insensitively
+/// as a substring against the foreground app's exe stem — see
+/// `handy2::app_context::is_verbatim_app`.
+fn default_h2_verbatim_apps() -> Vec<String> {
+    vec![
+        "claude".to_string(),
+        "code".to_string(),
+        "windowsterminal".to_string(),
+        "wt".to_string(),
+        "powershell".to_string(),
+        "cmd".to_string(),
+        "conhost".to_string(),
     ]
 }
 
@@ -883,6 +907,7 @@ pub fn get_default_settings() -> AppSettings {
         h2_enabled: false,
         h2_memory_file_path: None,
         h2_routes: default_h2_routes(),
+        h2_verbatim_apps: default_h2_verbatim_apps(),
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),
