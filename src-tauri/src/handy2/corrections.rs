@@ -101,6 +101,114 @@ pub fn parse_rules(memory: &str) -> Vec<CorrectionRule> {
     rules
 }
 
+/// Validate a single correction cell (`heard` or `write`): rejects
+/// empty/whitespace-only text, `|` (would break the Markdown table), and `(`
+/// (would make `parse_rules` treat the row as context-conditional/LLM-only —
+/// see the module doc — so a taught row containing `(` would silently never
+/// apply deterministically, which is worse than refusing it up front).
+fn validate_cell(label: &str, cell: &str) -> Result<(), String> {
+    if cell.trim().is_empty() {
+        return Err(format!("'{label}' must not be empty."));
+    }
+    if cell.contains('|') {
+        return Err(format!("'{label}' must not contain '|' (breaks the table row)."));
+    }
+    if cell.contains('(') {
+        return Err(format!(
+            "'{label}' must not contain '(' (would make the row context-conditional and it would never apply automatically)."
+        ));
+    }
+    Ok(())
+}
+
+/// Append a new `| heard | write |` row to the memory file's
+/// `## Dictation Corrections` table, teaching a correction without the user
+/// hand-editing Markdown.
+///
+/// Algorithm: read the file, scan its lines tracking whether we're inside the
+/// `## Dictation Corrections` section (same `starts_with("## ")` /
+/// `starts_with(SECTION_HEADER)` heading logic `parse_rules` uses, so this
+/// stays in lockstep with what the parser considers the section boundary).
+/// While inside the section, remember the index of the last line recognized
+/// as a table row by `table_cells` (this includes the `| Heard | Write |`
+/// header and the `|---|---|` separator, which is intentional: we want the
+/// new row inserted after the *last* row of the table as it physically
+/// appears, not just after the last data row, so a table that is only a
+/// header+separator with zero data rows yet still gets the new row appended
+/// directly under the separator). The section ends at the next `## ` heading
+/// or EOF. If no table row was ever seen inside the section (or the section
+/// itself doesn't exist), that's an error — we refuse to guess where to
+/// splice text into a file that doesn't have the expected shape, rather than
+/// appending somewhere that could corrupt unrelated content.
+///
+/// Edge cases, explicit behavior:
+/// - `path` unreadable or missing on disk → `Err` (surfaced by the caller
+///   when `h2_memory_file_path` is `None`/unset, or here if the path is set
+///   but the file itself can't be read).
+/// - Memory file has no `## Dictation Corrections` section at all → `Err`
+///   naming the missing section, no write happens.
+/// - Section exists but has zero table rows (not even a header) → `Err`,
+///   since there is nothing to anchor "insert after the last row" to.
+///
+/// On success, writes the file back in place and returns `Ok(())`. The
+/// existing mtime/len-keyed `RULE_CACHE` invalidates itself on the next
+/// dictation once it observes the changed file, so no cache-busting call is
+/// needed here.
+pub fn append_correction_row(path: &str, heard: &str, write: &str) -> Result<(), String> {
+    validate_cell("Heard", heard)?;
+    validate_cell("Should be", write)?;
+    let heard = heard.trim();
+    let write = write.trim();
+
+    let memory = std::fs::read_to_string(path)
+        .map_err(|e| format!("Could not read memory file '{path}': {e}"))?;
+
+    let mut last_row_line_idx: Option<usize> = None;
+    let mut found_section = false;
+    let mut in_section = false;
+    let lines: Vec<&str> = memory.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("## ") {
+            in_section = line.trim_start().starts_with(SECTION_HEADER);
+            if in_section {
+                found_section = true;
+            }
+            continue;
+        }
+        if in_section && table_cells(line).is_some() {
+            last_row_line_idx = Some(idx);
+        }
+    }
+
+    if !found_section {
+        return Err(format!(
+            "Memory file has no '{SECTION_HEADER}' section; add one before teaching a correction."
+        ));
+    }
+    let Some(insert_after) = last_row_line_idx else {
+        return Err(format!(
+            "'{SECTION_HEADER}' section has no table rows to insert after."
+        ));
+    };
+
+    let new_row = format!("| {heard} | {write} |");
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len() + 1);
+    for (idx, line) in lines.iter().enumerate() {
+        out_lines.push((*line).to_string());
+        if idx == insert_after {
+            out_lines.push(new_row.clone());
+        }
+    }
+    // `Vec<&str>::lines()` drops the file's trailing newline (if any); restore
+    // one so the rewritten file still ends in `\n` like a normal text file.
+    let mut new_content = out_lines.join("\n");
+    new_content.push('\n');
+
+    std::fs::write(path, new_content)
+        .map_err(|e| format!("Could not write memory file '{path}': {e}"))?;
+    Ok(())
+}
+
 /// True when a match at `start` in `text` begins a sentence: start of text, or
 /// preceded (ignoring spaces/tabs) by end punctuation or a newline. STT often
 /// capitalizes proper-noun-shaped mishears mid-sentence ("call the Sloan
@@ -446,6 +554,201 @@ mod tests {
         let rules = parse_rules(FIXTURE);
         let once = apply("praise overview", &rules);
         assert_eq!(apply(&once, &rules), once);
+    }
+
+    #[test]
+    fn append_correction_row_inserts_inside_section_and_parses() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("h2_append_correction_basic_test.md");
+        std::fs::write(
+            &path,
+            "# Memory\n\
+             ## Dictation Corrections\n\
+             | Heard (wrong) | Write (right) |\n\
+             |---|---|\n\
+             | Sloan officer | loan officer |\n\
+             \n\
+             ## Snippets\n\
+             | Say | Paste |\n\
+             |---|---|\n\
+             | insert signoff | Best,<br>Levon |\n",
+        )
+        .expect("write fixture");
+        let p = path.to_str().expect("utf8 path");
+
+        append_correction_row(p, "praise overview", "appraisal review").expect("append ok");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        // New row landed immediately after the pre-existing data row, i.e.
+        // still inside '## Dictation Corrections', not after '## Snippets'
+        // and not tacked on at EOF.
+        let corrections_idx = after.find("## Dictation Corrections").unwrap();
+        let snippets_idx = after.find("## Snippets").unwrap();
+        let new_row_idx = after.find("| praise overview | appraisal review |").unwrap();
+        assert!(new_row_idx > corrections_idx && new_row_idx < snippets_idx);
+
+        let existing_row_idx = after.find("| Sloan officer | loan officer |").unwrap();
+        assert!(
+            new_row_idx > existing_row_idx,
+            "new row must come after the prior last row, not before it"
+        );
+
+        // Snippets table must be untouched.
+        assert!(after.contains("| insert signoff | Best,<br>Levon |"));
+
+        // parse_rules picks up the taught correction and applies it.
+        let rules = parse_rules(&after);
+        assert_eq!(
+            apply("the praise overview memo", &rules),
+            "the appraisal review memo"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_inserts_after_separator_when_no_data_rows_yet() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("h2_append_correction_empty_table_test.md");
+        std::fs::write(
+            &path,
+            "## Dictation Corrections\n\
+             | Heard (wrong) | Write (right) |\n\
+             |---|---|\n\
+             ## Number Rules\n\
+             - budget 140,000\n",
+        )
+        .expect("write fixture");
+        let p = path.to_str().expect("utf8 path");
+
+        append_correction_row(p, "bar war", "borrower").expect("append ok");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        let separator_idx = after.find("|---|---|").unwrap();
+        let number_rules_idx = after.find("## Number Rules").unwrap();
+        let new_row_idx = after.find("| bar war | borrower |").unwrap();
+        assert!(new_row_idx > separator_idx && new_row_idx < number_rules_idx);
+
+        let rules = parse_rules(&after);
+        assert_eq!(apply("the bar war called", &rules), "the borrower called");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_at_eof_with_no_trailing_heading() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("h2_append_correction_eof_test.md");
+        // No trailing newline and no section after Dictation Corrections —
+        // exercises the "next heading or EOF" boundary at end-of-file.
+        std::fs::write(
+            &path,
+            "## Dictation Corrections\n\
+             | Heard (wrong) | Write (right) |\n\
+             |---|---|\n\
+             | Sloan officer | loan officer |",
+        )
+        .expect("write fixture");
+        let p = path.to_str().expect("utf8 path");
+
+        append_correction_row(p, "praise overview", "appraisal review").expect("append ok");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        let rules = parse_rules(&after);
+        let heards: Vec<&str> = rules.iter().map(|r| r.heard.as_str()).collect();
+        assert!(heards.contains(&"Sloan officer"));
+        assert!(heards.contains(&"praise overview"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_rejects_missing_section() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("h2_append_correction_no_section_test.md");
+        std::fs::write(&path, "# Memory\n## Number Rules\n- budget 140,000\n")
+            .expect("write fixture");
+        let p = path.to_str().expect("utf8 path");
+
+        let before = std::fs::read_to_string(&path).expect("read fixture back");
+        let err = append_correction_row(p, "heard", "write")
+            .expect_err("must error when section is missing");
+        assert!(err.contains("Dictation Corrections"));
+
+        // File must be left untouched, not partially written / corrupted.
+        let after = std::fs::read_to_string(&path).expect("read after failed append");
+        assert_eq!(before, after);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_rejects_section_with_zero_table_rows() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("h2_append_correction_empty_section_test.md");
+        std::fs::write(
+            &path,
+            "## Dictation Corrections\nNo table here yet.\n## Number Rules\n- x\n",
+        )
+        .expect("write fixture");
+        let p = path.to_str().expect("utf8 path");
+
+        let err = append_correction_row(p, "heard", "write")
+            .expect_err("must error when section has no table rows at all");
+        assert!(err.contains("no table rows"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_rejects_unreadable_path() {
+        let err = append_correction_row("Z:/no/such/file.md", "heard", "write")
+            .expect_err("must error on unreadable path");
+        assert!(err.contains("Could not read"));
+    }
+
+    #[test]
+    fn append_correction_row_validates_heard_and_write() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("h2_append_correction_validation_test.md");
+        std::fs::write(
+            &path,
+            "## Dictation Corrections\n\
+             | Heard (wrong) | Write (right) |\n\
+             |---|---|\n\
+             | Sloan officer | loan officer |\n",
+        )
+        .expect("write fixture");
+        let p = path.to_str().expect("utf8 path");
+
+        // Empty / whitespace-only.
+        assert!(append_correction_row(p, "", "write").is_err());
+        assert!(append_correction_row(p, "heard", "").is_err());
+        assert!(append_correction_row(p, "   ", "write").is_err());
+        assert!(append_correction_row(p, "heard", "   ").is_err());
+
+        // Contains '|' (would break the table row).
+        assert!(append_correction_row(p, "a | b", "write").is_err());
+        assert!(append_correction_row(p, "heard", "a | b").is_err());
+
+        // Contains '(' (would become context-conditional / LLM-only, i.e.
+        // would silently never apply deterministically).
+        assert!(append_correction_row(p, "valley (value context)", "value").is_err());
+        assert!(append_correction_row(p, "heard", "value (approx)").is_err());
+
+        // File must be untouched after every rejection above.
+        let after = std::fs::read_to_string(&path).expect("read after rejections");
+        assert!(!after.contains("| a | b |"));
+        assert!(!after.contains("valley (value context)"));
+        assert_eq!(
+            after,
+            "## Dictation Corrections\n\
+             | Heard (wrong) | Write (right) |\n\
+             |---|---|\n\
+             | Sloan officer | loan officer |\n"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

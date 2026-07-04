@@ -849,6 +849,14 @@ async setH2Routes(routes: Route[]) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async appendCorrection(heard: string, write: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("append_correction", { heard, write }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async testOllamaConnection() : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("test_ollama_connection") };

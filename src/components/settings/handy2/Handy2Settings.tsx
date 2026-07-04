@@ -22,6 +22,9 @@ export const Handy2Settings: React.FC = () => {
   const [keySaved, setKeySaved] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [correctionHeard, setCorrectionHeard] = useState("");
+  const [correctionWrite, setCorrectionWrite] = useState("");
+  const [correctionBusy, setCorrectionBusy] = useState(false);
 
   useEffect(() => {
     commands.hasOllamaKey().then((r) => {
@@ -62,6 +65,20 @@ export const Handy2Settings: React.FC = () => {
   const saveMemoryPath = async (value: string) => {
     await commands.setH2MemoryPath(value.trim() === "" ? null : value);
     await refreshSettings();
+  };
+
+  const addCorrection = async () => {
+    setCorrectionBusy(true);
+    setStatus(null);
+    const r = await commands.appendCorrection(correctionHeard, correctionWrite);
+    if (r.status === "ok") {
+      setCorrectionHeard("");
+      setCorrectionWrite("");
+      setStatus("Correction added. It will apply on the next dictation.");
+    } else {
+      setStatus(r.error);
+    }
+    setCorrectionBusy(false);
   };
 
   const saveRouteModel = async (index: number, model: string) => {
@@ -129,6 +146,43 @@ export const Handy2Settings: React.FC = () => {
           placeholder="C:\\Users\\you\\Vault\\handy-memory.md"
           onBlur={(e) => saveMemoryPath(e.target.value)}
         />
+
+        <SettingContainer
+          title="Teach a correction"
+          description="Adds a row to the Dictation Corrections table. Applies on the next dictation — no restart needed."
+          layout="stacked"
+        >
+          <div className="flex flex-col gap-2 w-full">
+            <div className="flex gap-2 w-full">
+              <input
+                type="text"
+                className={inputClass}
+                placeholder="Heard (e.g. Sloan officer)"
+                value={correctionHeard}
+                onChange={(e) => setCorrectionHeard(e.target.value)}
+              />
+              <input
+                type="text"
+                className={inputClass}
+                placeholder="Should be (e.g. loan officer)"
+                value={correctionWrite}
+                onChange={(e) => setCorrectionWrite(e.target.value)}
+              />
+            </div>
+            <button
+              type="button"
+              className={buttonClass}
+              onClick={addCorrection}
+              disabled={
+                correctionBusy ||
+                correctionHeard.trim() === "" ||
+                correctionWrite.trim() === ""
+              }
+            >
+              Add correction
+            </button>
+          </div>
+        </SettingContainer>
       </SettingsGroup>
 
       <SettingsGroup

@@ -1,7 +1,7 @@
 //! Handy 2.0 commands: Ollama key (OS credential store), h2 settings, test
 //! connection. Follows Handy's command conventions (Result<_, String>).
 
-use crate::handy2::secrets;
+use crate::handy2::{corrections, secrets};
 use crate::settings::{get_settings, write_settings, Route};
 use tauri::AppHandle;
 
@@ -45,6 +45,19 @@ pub fn set_h2_memory_path(app: AppHandle, path: Option<String>) -> Result<(), St
     s.h2_memory_file_path = path.filter(|p| !p.trim().is_empty());
     write_settings(&app, s);
     Ok(())
+}
+
+/// Teach a correction from Settings: appends a `| heard | write |` row to the
+/// configured memory file's `## Dictation Corrections` table. Applies on the
+/// next dictation with no restart — `corrections::cached_memory`'s mtime/len
+/// check picks up the on-disk change automatically.
+#[tauri::command]
+#[specta::specta]
+pub fn append_correction(app: AppHandle, heard: String, write: String) -> Result<(), String> {
+    let path = get_settings(&app)
+        .h2_memory_file_path
+        .ok_or_else(|| "No memory file path configured in Handy 2.0 settings.".to_string())?;
+    corrections::append_correction_row(&path, &heard, &write)
 }
 
 #[tauri::command]

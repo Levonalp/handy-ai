@@ -436,6 +436,7 @@ pub fn run(cli_args: CliArgs) {
             commands::handy2::set_h2_memory_path,
             commands::handy2::set_h2_routes,
             commands::handy2::test_ollama_connection,
+            commands::handy2::append_correction,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![managers::history::HistoryUpdatePayload,]);
