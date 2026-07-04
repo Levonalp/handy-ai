@@ -126,7 +126,9 @@ fn validate_cell(label: &str, cell: &str, allow_slash: bool) -> Result<(), Strin
         return Err(format!("'{label}' must not be empty."));
     }
     if cell.contains('|') {
-        return Err(format!("'{label}' must not contain '|' (breaks the table row)."));
+        return Err(format!(
+            "'{label}' must not contain '|' (breaks the table row)."
+        ));
     }
     if cell.contains('(') {
         return Err(format!(
@@ -607,7 +609,9 @@ mod tests {
         // and not tacked on at EOF.
         let corrections_idx = after.find("## Dictation Corrections").unwrap();
         let snippets_idx = after.find("## Snippets").unwrap();
-        let new_row_idx = after.find("| praise overview | appraisal review |").unwrap();
+        let new_row_idx = after
+            .find("| praise overview | appraisal review |")
+            .unwrap();
         assert!(new_row_idx > corrections_idx && new_row_idx < snippets_idx);
 
         let existing_row_idx = after.find("| Sloan officer | loan officer |").unwrap();
@@ -798,7 +802,10 @@ mod tests {
 
         let err = append_correction_row(p, "praise overview", "appraisal review/summary")
             .expect_err("'/' in write must be rejected");
-        assert!(err.contains('/'), "error should mention the offending character: {err}");
+        assert!(
+            err.contains('/'),
+            "error should mention the offending character: {err}"
+        );
 
         // File must be untouched, matching the existing rejection-test
         // before/after byte-equality pattern.

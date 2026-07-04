@@ -953,9 +953,7 @@ impl TranscriptionManager {
     pub fn begin_streaming(&self, app: AppHandle, binding_id: String) {
         let mut sessions = self.streaming_sessions.lock().unwrap();
         if sessions.contains_key(&binding_id) {
-            debug!(
-                "begin_streaming: session already active for binding {binding_id}, ignoring"
-            );
+            debug!("begin_streaming: session already active for binding {binding_id}, ignoring");
             return;
         }
         let session = Arc::new(StreamingSession {
@@ -972,16 +970,15 @@ impl TranscriptionManager {
         // itself be the reason `Arc::strong_count(&self.engine) > 1` stays
         // true in `TranscriptionManager::drop` — a leaked/slow-to-exit poll
         // thread must not block the app's shutdown-detection logic.
-        let manager_weak: Weak<TranscriptionManager> = match app
-            .try_state::<Arc<TranscriptionManager>>()
-        {
-            Some(state) => Arc::downgrade(&state),
-            None => {
-                error!("begin_streaming: TranscriptionManager not registered as app state");
-                self.streaming_sessions.lock().unwrap().remove(&binding_id);
-                return;
-            }
-        };
+        let manager_weak: Weak<TranscriptionManager> =
+            match app.try_state::<Arc<TranscriptionManager>>() {
+                Some(state) => Arc::downgrade(&state),
+                None => {
+                    error!("begin_streaming: TranscriptionManager not registered as app state");
+                    self.streaming_sessions.lock().unwrap().remove(&binding_id);
+                    return;
+                }
+            };
 
         let vad_path = match app.path().resolve(
             "resources/models/silero_vad_v4.onnx",
@@ -1138,8 +1135,7 @@ impl TranscriptionManager {
                                 if !trimmed.is_empty() {
                                     inner.segments.push(trimmed.to_string());
                                     let joined = inner.segments.join(" ");
-                                    let _ = app_for_thread
-                                        .emit("transcript-partial", joined);
+                                    let _ = app_for_thread.emit("transcript-partial", joined);
                                 }
                             }
                             Err(e) => {
@@ -1409,9 +1405,7 @@ mod streaming_tests {
 
     /// `n` samples of a loud sine "speech" burst (amplitude well above threshold).
     fn speech(n: usize) -> Vec<f32> {
-        (0..n)
-            .map(|i| 0.8 * (i as f32 * 0.4).sin())
-            .collect()
+        (0..n).map(|i| 0.8 * (i as f32 * 0.4).sin()).collect()
     }
 
     /// Convert a duration in ms to an exact whole number of VAD frames' worth
@@ -1560,7 +1554,11 @@ mod streaming_tests {
     #[test]
     fn session_segments_join_in_order() {
         let inner = StreamingSessionInner {
-            segments: vec!["hello".to_string(), "world".to_string(), "again".to_string()],
+            segments: vec![
+                "hello".to_string(),
+                "world".to_string(),
+                "again".to_string(),
+            ],
             carry: Vec::new(),
         };
         assert_eq!(inner.segments.join(" "), "hello world again");

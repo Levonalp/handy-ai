@@ -373,8 +373,13 @@ pub(crate) async fn process_transcription_output(
     foreground_app: Option<String>,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
-    process_transcription_output_with_settings(&settings, transcription, post_process, foreground_app)
-        .await
+    process_transcription_output_with_settings(
+        &settings,
+        transcription,
+        post_process,
+        foreground_app,
+    )
+    .await
 }
 
 /// Core of [`process_transcription_output`], taking already-loaded
@@ -408,9 +413,9 @@ async fn process_transcription_output_with_settings(
     // EVEN the dedicated force-post-process binding (`post_process == true`)
     // and the spoken hotword trigger below — that's the point of the list;
     // remove an app from settings to re-enable LLM routing for it.
-    let verbatim_app = foreground_app
-        .as_deref()
-        .filter(|name| crate::handy2::app_context::is_verbatim_app(name, &settings.h2_verbatim_apps));
+    let verbatim_app = foreground_app.as_deref().filter(|name| {
+        crate::handy2::app_context::is_verbatim_app(name, &settings.h2_verbatim_apps)
+    });
 
     // One-hotkey UX: the raw binding also routes through h2 when the user
     // SPOKE a route trigger ("Polish command, ..."). The dedicated
@@ -921,7 +926,7 @@ mod h2_gate_tests {
         let cases = [
             (false, h2_spoken_hotword(&h2_on, plain), false), // primary + plain -> no LLM (unchanged)
             (false, h2_spoken_hotword(&h2_on, triggered), true), // primary + hotword -> LLM (new)
-            (true, h2_spoken_hotword(&h2_on, plain), true),   // dedicated + plain -> LLM (unchanged)
+            (true, h2_spoken_hotword(&h2_on, plain), true), // dedicated + plain -> LLM (unchanged)
             (true, h2_spoken_hotword(&h2_on, triggered), true), // dedicated + hotword -> LLM (unchanged)
         ];
 

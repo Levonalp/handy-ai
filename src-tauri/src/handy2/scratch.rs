@@ -116,7 +116,9 @@ fn has_trailing_boundary(text: &str, word_end: usize) -> bool {
     }
     // Back-to-back marker: allow an already-unabsorbed leading comma before
     // it too (e.g. the second marker in "scratch that, scratch that, ...").
-    let after_comma = trimmed.trim_start_matches(',').trim_start_matches([' ', '\t']);
+    let after_comma = trimmed
+        .trim_start_matches(',')
+        .trim_start_matches([' ', '\t']);
     bare_marker_regex()
         .find(after_comma)
         .is_some_and(|m| m.start() == 0)
@@ -308,7 +310,10 @@ mod tests {
         // noun object, sentence-initial (no leading clause at all), no
         // comma anywhere. `has_trailing_boundary` rejects on the trailing
         // side (" itch." is lowercase, no comma).
-        assert_eq!(apply_scratch_that("Scratch that itch."), "Scratch that itch.");
+        assert_eq!(
+            apply_scratch_that("Scratch that itch."),
+            "Scratch that itch."
+        );
         // "I'll strike that off my list" — comma-less, "that" as object of
         // "strike" again, this time followed by a preposition rather than a
         // noun. Confirms the fix isn't narrowly tuned to only reject

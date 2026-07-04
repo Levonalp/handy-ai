@@ -58,7 +58,9 @@ pub fn remember(binding_id: &str, name: Option<String>) {
 /// across the app's lifetime — each dictation's entry is consumed exactly
 /// once by its own stop-time gate check.
 pub fn take(binding_id: &str) -> Option<String> {
-    captured_apps().ok_or_lock().and_then(|mut map| map.remove(binding_id))
+    captured_apps()
+        .ok_or_lock()
+        .and_then(|mut map| map.remove(binding_id))
 }
 
 /// Small local extension so a poisoned lock degrades to "no capture" instead
@@ -130,7 +132,12 @@ pub fn foreground_process_name() -> Option<String> {
         // best-effort lookup.
         let mut buf = [0u16; 260];
         let mut len: u32 = buf.len() as u32;
-        let result = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len);
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
         let _ = CloseHandle(handle);
 
         if result.is_err() || len == 0 {

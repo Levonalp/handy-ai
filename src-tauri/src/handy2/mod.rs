@@ -96,7 +96,10 @@ fn output_resembles_input(input: &str, output: &str) -> bool {
 /// and `None` only on the early-return paths before any LLM call starts
 /// (hotword-only utterance, provider preset missing, no API key), where there
 /// is genuinely no LLM duration to report.
-pub async fn post_process(settings: &AppSettings, transcription: &str) -> (Option<String>, Option<u64>) {
+pub async fn post_process(
+    settings: &AppSettings,
+    transcription: &str,
+) -> (Option<String>, Option<u64>) {
     let decision = routing::route(transcription, &settings.h2_routes);
     if decision.cleaned_text.is_empty() {
         debug!("h2: hotword-only utterance, nothing to format");
@@ -312,7 +315,10 @@ mod tests {
         // the polish route but yields empty cleaned_text -> post_process's
         // very first early return, before any LLM call is attempted.
         let (text, llm_ms) = post_process(&settings, "Polish command").await;
-        assert_eq!(text, None, "hotword-only utterance should fall back to None");
+        assert_eq!(
+            text, None,
+            "hotword-only utterance should fall back to None"
+        );
         assert_eq!(
             llm_ms, None,
             "no LLM call was attempted on this path, so the duration must be \
