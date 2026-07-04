@@ -40,5 +40,8 @@ blob-report/
 .direnv
 .envrc
 
+# Subagent-driven-development scratch state (per-session progress ledger)
+.superpowers/
+
 # Nix build output
 result

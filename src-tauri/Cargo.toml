@@ -1,6 +1,6 @@
 [package]
 name = "handy"
-version = "0.8.3"
+version = "0.9.1"
 description = "Handy"
 authors = ["cjpais"]
 edition = "2021"
@@ -59,6 +59,10 @@ env_filter = "0.1.0"
 tokio = "1.43.0"
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 enigo = "0.6.1"
+# Handy 2.0: rich-text (HTML) clipboard so formatted lists render as real bullets
+# in Outlook/Word/Teams while plain fields still get the literal Markdown text.
+arboard = "3"
+pulldown-cmark = "0.12"
 rodio = { git = "https://github.com/cjpais/rodio.git" }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
@@ -90,13 +94,19 @@ tauri-plugin-single-instance = "2.3.2"
 tauri-plugin-updater = "2.10.0"
 
 [target.'cfg(windows)'.dependencies]
-transcribe-rs = { version = "0.3.3", features = ["whisper-vulkan", "ort-directml"] }
+# whisper-cpp (CPU) instead of whisper-vulkan: the Vulkan path exists only for
+# Whisper-family models (we run Parakeet/ONNX day-to-day) and its nested
+# vulkan-shaders-gen cmake build is unbuildable on this machine's local
+# toolchain. CPU whisper keeps the fallback engine working; ort-directml stays
+# available for ONNX experiments (the accelerator *setting* is "cpu").
+transcribe-rs = { version = "0.3.3", features = ["whisper-cpp", "ort-directml"] }
 windows = { version = "0.61.3", features = [
   "Win32_Media_Audio_Endpoints",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Variant",
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
 ] }
 winreg = "0.55"
 

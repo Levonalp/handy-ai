@@ -13,6 +13,19 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use crate::utils::{is_kde_wayland, is_wayland};
 
 /// Pastes text using the clipboard: saves current content, writes text, sends paste keystroke, restores clipboard.
+/// Handy 2.0: write BOTH rich HTML (so formatted lists render as real bullets in
+/// Outlook/Word/Teams) and the plain Markdown text (literal `- item` / `1.` for
+/// code and plain fields) to the clipboard. Each destination app picks the
+/// format it supports.
+#[cfg(not(target_os = "linux"))]
+fn write_rich_clipboard(text: &str) -> Result<(), String> {
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, pulldown_cmark::Parser::new(text));
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_html(html, Some(text.to_string()))
+        .map_err(|e| e.to_string())
+}
+
 fn paste_via_clipboard(
     enigo: &mut Enigo,
     text: &str,
@@ -36,9 +49,12 @@ fn paste_via_clipboard(
     };
 
     #[cfg(not(target_os = "linux"))]
-    let write_result = clipboard
-        .write_text(text)
-        .map_err(|e| format!("Failed to write to clipboard: {}", e));
+    let write_result = write_rich_clipboard(text).or_else(|e| {
+        log::warn!("rich clipboard write failed ({e}); falling back to plain text");
+        clipboard
+            .write_text(text)
+            .map_err(|e| format!("Failed to write to clipboard: {}", e))
+    });
 
     write_result?;
 

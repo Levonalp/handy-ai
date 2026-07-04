@@ -106,6 +106,18 @@ pub struct PostProcessProvider {
     pub supports_structured_output: bool,
 }
 
+/// A Handy 2.0 hotword route: spoken prefix → Ollama model + prompt addendum.
+#[derive(Serialize, Deserialize, Debug, Clone, Type, PartialEq)]
+pub struct Route {
+    pub id: String,
+    /// Spoken hotword prefix; `None` = default route.
+    pub trigger: Option<String>,
+    /// Ollama model ID for this route.
+    pub ollama_model: String,
+    /// Appended to the base system prompt when this route fires.
+    pub prompt_addendum: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum OverlayPosition {
@@ -401,6 +413,21 @@ pub struct AppSettings {
     pub post_process_prompts: Vec<LLMPrompt>,
     #[serde(default)]
     pub post_process_selected_prompt_id: Option<String>,
+    // --- Handy 2.0 additions ---
+    #[serde(default)]
+    pub h2_enabled: bool,
+    #[serde(default)]
+    pub h2_memory_file_path: Option<String>,
+    #[serde(default = "default_h2_routes")]
+    pub h2_routes: Vec<Route>,
+    /// App-aware verbatim list: case-insensitive substring match against the
+    /// foreground app's exe stem at RECORDING START. A match suppresses h2
+    /// LLM routing entirely for that dictation — beating even the dedicated
+    /// force-post-process binding — because dictating into a terminal or
+    /// coding agent almost always wants exact words, not a rewrite. Remove
+    /// an app from this list to re-enable LLM routing for it.
+    #[serde(default = "default_h2_verbatim_apps")]
+    pub h2_verbatim_apps: Vec<String>,
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
@@ -430,6 +457,16 @@ pub struct AppSettings {
     pub whisper_gpu_device: i32,
     #[serde(default)]
     pub extra_recording_buffer_ms: u64,
+    /// Transcribe audio segments in the background WHILE the user is still
+    /// speaking (cut at VAD-detected pauses), instead of waiting for the key
+    /// release to transcribe the whole clip. Escape hatch back to the old
+    /// whole-clip-on-release behavior if streaming ever misbehaves.
+    #[serde(default = "default_true")]
+    pub streaming_enabled: bool,
+    /// Minimum confirmed silence, in milliseconds, before segment-streaming
+    /// will cut and transcribe the audio before that pause.
+    #[serde(default = "default_streaming_min_silence_ms")]
+    pub streaming_min_silence_ms: u64,
 }
 
 fn default_model() -> String {
@@ -453,7 +490,10 @@ fn default_autostart_enabled() -> bool {
 }
 
 fn default_update_checks_enabled() -> bool {
-    true
+    // Fork safety: the stock updater points at github.com/cjpais/Handy.
+    // Accepting an upstream release would replace this fork and silently
+    // delete the h2 layer. Upstream updates are taken deliberately via git.
+    false
 }
 
 fn default_selected_language() -> String {
@@ -521,8 +561,65 @@ fn default_post_process_provider_id() -> String {
     "openai".to_string()
 }
 
+/// Handy 2.0 default hotword routes (ported from v1). Re-verify model IDs at
+/// build time (Ollama Cloud catalog).
+pub fn default_h2_routes() -> Vec<Route> {
+    vec![
+        Route {
+            id: "polish".to_string(),
+            trigger: Some("Polish command".to_string()),
+            ollama_model: "qwen2.5:3b-instruct".to_string(),
+            prompt_addendum: Some(
+                "Rewrite the following dictation into a highly professional, structured email \
+                 or document suitable for corporate communications."
+                    .to_string(),
+            ),
+        },
+        Route {
+            id: "prompt_engineering".to_string(),
+            trigger: Some("Prompt engineering command".to_string()),
+            ollama_model: "qwen2.5:3b-instruct".to_string(),
+            prompt_addendum: Some(
+                "Format this as a highly detailed, structured prompt for an AI coding agent \
+                 like Claude or Cursor."
+                    .to_string(),
+            ),
+        },
+        Route {
+            id: "standard".to_string(),
+            trigger: None,
+            ollama_model: "qwen2.5:3b-instruct".to_string(),
+            prompt_addendum: None,
+        },
+    ]
+}
+
+/// Default app-aware verbatim list (Task E5): terminals and coding agents
+/// where dictation should never be LLM-rewritten. Matched case-insensitively
+/// as a substring against the foreground app's exe stem — see
+/// `handy2::app_context::is_verbatim_app`.
+fn default_h2_verbatim_apps() -> Vec<String> {
+    vec![
+        "claude".to_string(),
+        "code".to_string(),
+        "windowsterminal".to_string(),
+        "wt".to_string(),
+        "powershell".to_string(),
+        "cmd".to_string(),
+        "conhost".to_string(),
+    ]
+}
+
 fn default_post_process_providers() -> Vec<PostProcessProvider> {
     let mut providers = vec![
+        PostProcessProvider {
+            id: "ollama".to_string(),
+            label: "Local LLM (Ollama)".to_string(),
+            base_url: "http://localhost:11435/v1".to_string(),
+            allow_base_url_edit: true,
+            models_endpoint: Some("/models".to_string()),
+            supports_structured_output: false,
+        },
         PostProcessProvider {
             id: "openai".to_string(),
             label: "OpenAI".to_string(),
@@ -648,6 +745,14 @@ fn default_post_process_prompts() -> Vec<LLMPrompt> {
 
 fn default_whisper_gpu_device() -> i32 {
     -1 // auto
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_streaming_min_silence_ms() -> u64 {
+    500
 }
 
 fn default_typing_tool() -> TypingTool {
@@ -799,6 +904,10 @@ pub fn get_default_settings() -> AppSettings {
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
+        h2_enabled: false,
+        h2_memory_file_path: None,
+        h2_routes: default_h2_routes(),
+        h2_verbatim_apps: default_h2_verbatim_apps(),
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),
@@ -814,6 +923,8 @@ pub fn get_default_settings() -> AppSettings {
         ort_accelerator: OrtAcceleratorSetting::default(),
         whisper_gpu_device: default_whisper_gpu_device(),
         extra_recording_buffer_ms: 0,
+        streaming_enabled: default_true(),
+        streaming_min_silence_ms: default_streaming_min_silence_ms(),
     }
 }
 

@@ -42,6 +42,8 @@ struct ChatCompletionRequest {
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +103,10 @@ fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwes
     let headers = build_headers(provider, api_key)?;
     reqwest::Client::builder()
         .default_headers(headers)
+        // 15s = worst legitimate case (1s prefill + ~150 tokens at 18 tok/s ≈ 9s)
+        // with margin. Shared by fetch_models too (fine: a model list that
+        // slow is already a broken provider).
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
@@ -125,6 +131,7 @@ pub async fn send_chat_completion(
         None,
         reasoning_effort,
         reasoning,
+        None,
     )
     .await
 }
@@ -134,6 +141,7 @@ pub async fn send_chat_completion(
 /// system_prompt is used as the system message when provided
 /// reasoning_effort sets the OpenAI-style top-level field (e.g., "none", "low", "medium", "high")
 /// reasoning sets the OpenRouter-style nested object (effort + exclude)
+/// max_tokens caps generated output length; `None` leaves the provider's default
 pub async fn send_chat_completion_with_schema(
     provider: &PostProcessProvider,
     api_key: String,
@@ -143,6 +151,7 @@ pub async fn send_chat_completion_with_schema(
     json_schema: Option<Value>,
     reasoning_effort: Option<String>,
     reasoning: Option<ReasoningConfig>,
+    max_tokens: Option<u32>,
 ) -> Result<Option<String>, String> {
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
@@ -184,6 +193,7 @@ pub async fn send_chat_completion_with_schema(
         response_format,
         reasoning_effort,
         reasoning,
+        max_tokens,
     };
 
     let response = client

@@ -13,6 +13,7 @@
     "models": "Models",
     "advanced": "Advanced",
     "postProcessing": "Post Process",
+    "handy2": "Handy 2.0",
     "history": "History",
     "debug": "Debug",
     "about": "About"
@@ -356,6 +357,32 @@
         "add": "Add",
         "remove": "Remove {{word}}",
         "duplicate": "\"{{word}}\" already exists"
+      }
+    },
+    "handy2": {
+      "title": "Handy 2.0 — Ollama Formatting",
+      "enablement": {
+        "label": "Enable Handy 2.0 routing & memory",
+        "description": "Route dictation through hotword commands and your Obsidian vocabulary, formatted by Ollama Cloud."
+      },
+      "ollama": {
+        "title": "Ollama Cloud"
+      },
+      "key": {
+        "label": "API key",
+        "description": "Stored in the OS credential store, never in plaintext settings.",
+        "save": "Save key",
+        "test": "Test connection",
+        "saved": "API key saved to the OS credential store."
+      },
+      "memory": {
+        "title": "Obsidian memory file",
+        "description": "Absolute path to a Markdown vocabulary file. Re-read on every dictation."
+      },
+      "routes": {
+        "title": "Command routes",
+        "description": "Per-route Ollama model. Say the trigger phrase first to switch routes.",
+        "default": "default (no hotword)"
       }
     },
     "postProcessing": {
