@@ -102,11 +102,26 @@ pub fn parse_rules(memory: &str) -> Vec<CorrectionRule> {
 }
 
 /// Validate a single correction cell (`heard` or `write`): rejects
-/// empty/whitespace-only text, `|` (would break the Markdown table), and `(`
+/// empty/whitespace-only text, `|` (would break the Markdown table), `(`
 /// (would make `parse_rules` treat the row as context-conditional/LLM-only —
 /// see the module doc — so a taught row containing `(` would silently never
-/// apply deterministically, which is worse than refusing it up front).
-fn validate_cell(label: &str, cell: &str) -> Result<(), String> {
+/// apply deterministically, which is worse than refusing it up front), and
+/// any ASCII/Unicode control character (`char::is_control`) — this catches
+/// `\n`/`\r` (which would splice the row across physical lines and corrupt
+/// the Markdown table structure, see the module doc) plus stray `\t` and
+/// other control chars in one sweep, while ordinary text, punctuation, and
+/// non-ASCII letters (e.g. Chinese) still pass.
+///
+/// `allow_slash` is `false` for the `write` cell only: `parse_rules:82` skips
+/// any row whose WRITE cell contains `/`, so a taught replacement containing
+/// `/` would silently never apply, exactly like the `(` case above. The
+/// HEARD cell is the opposite: `parse_rules:85` splits it on `" / "` to let
+/// one row teach multiple heard-variants (e.g. `foo / phoo` both mean
+/// `bar`), so `/` there is meaningful and must stay allowed. A single
+/// bool-parameterized function (rather than two near-duplicate functions)
+/// keeps the shared checks — empty, `|`, `(`, control chars — in one place
+/// while making the `/` rule the only cell-specific branch.
+fn validate_cell(label: &str, cell: &str, allow_slash: bool) -> Result<(), String> {
     if cell.trim().is_empty() {
         return Err(format!("'{label}' must not be empty."));
     }
@@ -117,6 +132,14 @@ fn validate_cell(label: &str, cell: &str) -> Result<(), String> {
         return Err(format!(
             "'{label}' must not contain '(' (would make the row context-conditional and it would never apply automatically)."
         ));
+    }
+    if !allow_slash && cell.contains('/') {
+        return Err(format!(
+            "'{label}' must not contain '/' (it would prevent the correction from applying)."
+        ));
+    }
+    if cell.chars().any(|c| c.is_control()) {
+        return Err(format!("'{label}' must not contain line breaks."));
     }
     Ok(())
 }
@@ -155,8 +178,8 @@ fn validate_cell(label: &str, cell: &str) -> Result<(), String> {
 /// dictation once it observes the changed file, so no cache-busting call is
 /// needed here.
 pub fn append_correction_row(path: &str, heard: &str, write: &str) -> Result<(), String> {
-    validate_cell("Heard", heard)?;
-    validate_cell("Should be", write)?;
+    validate_cell("Heard", heard, true)?;
+    validate_cell("Should be", write, false)?;
     let heard = heard.trim();
     let write = write.trim();
 
@@ -747,6 +770,107 @@ mod tests {
              |---|---|\n\
              | Sloan officer | loan officer |\n"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fixture path for the '/' and control-char rejection tests below.
+    /// Shared name kept unique per test (via a distinct suffix) so tests
+    /// running in parallel don't clash on the same file.
+    fn write_fixture(name: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(name);
+        let contents = "## Dictation Corrections\n\
+             | Heard (wrong) | Write (right) |\n\
+             |---|---|\n\
+             | Sloan officer | loan officer |\n";
+        std::fs::write(&path, contents).expect("write fixture");
+        (path, contents.to_string())
+    }
+
+    #[test]
+    fn append_correction_row_rejects_slash_in_write_cell_only() {
+        // Finding 1 (review): parse_rules:82 silently skips any row whose
+        // WRITE cell contains '/', so accepting it here would write a row
+        // that looks taught but never actually fires. Must be rejected.
+        let (path, before) = write_fixture("h2_append_correction_slash_write_test.md");
+        let p = path.to_str().expect("utf8 path");
+
+        let err = append_correction_row(p, "praise overview", "appraisal review/summary")
+            .expect_err("'/' in write must be rejected");
+        assert!(err.contains('/'), "error should mention the offending character: {err}");
+
+        // File must be untouched, matching the existing rejection-test
+        // before/after byte-equality pattern.
+        let after = std::fs::read_to_string(&path).expect("read after rejection");
+        assert_eq!(before, after);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_accepts_slash_in_heard_cell() {
+        // Critical asymmetry (review finding 1): parse_rules:85 splits the
+        // HEARD cell on " / " to let one row teach multiple heard-variants,
+        // so '/' there is meaningful and must NOT be rejected. This is a
+        // positive test guarding against a future refactor accidentally
+        // making the '/' check symmetric.
+        let (path, _before) = write_fixture("h2_append_correction_slash_heard_test.md");
+        let p = path.to_str().expect("utf8 path");
+
+        append_correction_row(p, "foo / phoo", "bar").expect("'/' in heard must be accepted");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert!(after.contains("| foo / phoo | bar |"));
+
+        // Both heard-variants parsed out of the '/'-joined cell and both
+        // apply the same replacement.
+        let rules = parse_rules(&after);
+        assert_eq!(apply("i said foo just now", &rules), "i said bar just now");
+        assert_eq!(apply("i said phoo just now", &rules), "i said bar just now");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_rejects_newline_in_write_cell() {
+        // Finding 2 (review): an embedded '\n' in write would splice the
+        // row across two physical lines via format!()+join("\n"), corrupting
+        // the Markdown table (e.g. injecting a fake "## " heading line).
+        let (path, before) = write_fixture("h2_append_correction_newline_write_test.md");
+        let p = path.to_str().expect("utf8 path");
+
+        let err = append_correction_row(p, "heard text", "value\n## Fake Heading")
+            .expect_err("embedded newline in write must be rejected");
+        assert!(
+            err.contains("line break"),
+            "error should mention line breaks: {err}"
+        );
+
+        let after = std::fs::read_to_string(&path).expect("read after rejection");
+        assert_eq!(before, after);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_correction_row_rejects_carriage_return_in_heard_cell() {
+        // Same class as the newline-in-write test above, but covering the
+        // OTHER cell and the OTHER control character ('\r'), since the
+        // control-char sweep applies identically to both cells (unlike the
+        // '/' check, which is write-only).
+        let (path, before) = write_fixture("h2_append_correction_cr_heard_test.md");
+        let p = path.to_str().expect("utf8 path");
+
+        let err = append_correction_row(p, "heard\r## Injected", "write")
+            .expect_err("embedded carriage return in heard must be rejected");
+        assert!(
+            err.contains("line break"),
+            "error should mention line breaks: {err}"
+        );
+
+        let after = std::fs::read_to_string(&path).expect("read after rejection");
+        assert_eq!(before, after);
 
         let _ = std::fs::remove_file(&path);
     }
