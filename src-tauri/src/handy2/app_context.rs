@@ -27,13 +27,28 @@ fn captured_apps() -> &'static Mutex<HashMap<String, String>> {
 }
 
 /// Record the foreground app stem for this binding at recording start.
-/// `name: None` (no foreground window, or the Win32 call failed) simply
-/// means no entry is stored, so `take` later returns `None` and the gate
-/// falls back to normal routing for that dictation.
+///
+/// `name: None` (no foreground window, or the Win32 call failed) actively
+/// REMOVES any pre-existing entry for this `binding_id`, rather than leaving
+/// it untouched. Without this, a stale entry from a prior dictation on the
+/// same binding could survive and be wrongly `take()`n by a later dictation:
+/// e.g. dictation 1 captures "powershell" then never reaches the stop-time
+/// `take()` (cancelled, empty samples, transcription error), leaving the
+/// entry in the map; dictation 2 on the same binding starts with no
+/// foreground window detected (`None`) — if `remember` were a no-op here,
+/// dictation 2's `take()` would return the STALE "powershell" from dictation
+/// 1 and be wrongly treated as a verbatim app. Each `start()` call must fully
+/// determine this binding's entry — present or absent — never inherit one
+/// left over from an earlier dictation.
 pub fn remember(binding_id: &str, name: Option<String>) {
-    if let Some(name) = name {
-        if let Ok(mut map) = captured_apps().lock() {
-            map.insert(binding_id.to_string(), name);
+    if let Ok(mut map) = captured_apps().lock() {
+        match name {
+            Some(name) => {
+                map.insert(binding_id.to_string(), name);
+            }
+            None => {
+                map.remove(binding_id);
+            }
         }
     }
 }
@@ -216,6 +231,26 @@ mod tests {
         let binding = "e5-test-binding-none";
         remember(binding, None);
         assert_eq!(take(binding), None);
+    }
+
+    /// Task E5 review finding 2 (stale-entry misfire): a `None` capture must
+    /// actively clear any pre-existing entry for this binding, not leave it
+    /// untouched. Reproduces the exact failure sequence: dictation 1 captures
+    /// "a" but its `take()` is never reached (cancelled/empty/error path),
+    /// then dictation 2 on the SAME binding starts with no foreground window
+    /// detected (`None`). Without the fix, dictation 2's `take()` would
+    /// return the stale "a" from dictation 1 instead of `None`.
+    #[test]
+    fn remember_none_clears_a_stale_prior_entry_for_the_same_binding() {
+        let binding = "e5-test-binding-stale-clear";
+        remember(binding, Some("a".to_string()));
+        // Simulate dictation 1's take() never being reached (cancel/empty/error).
+        remember(binding, None);
+        assert_eq!(
+            take(binding),
+            None,
+            "a None capture must clear the stale prior entry, not leave it for the next take()"
+        );
     }
 
     #[test]

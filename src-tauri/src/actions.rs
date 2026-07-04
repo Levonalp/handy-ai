@@ -1043,4 +1043,81 @@ mod h2_gate_tests {
         // case above (no "skip" log, gate condition evaluates true going in).
         assert_eq!(result.final_text, transcription);
     }
+
+    /// Task E5 review finding 1 (test-gap): pins the CORRECTED gate shape —
+    /// `if verbatim_app.is_none() && would_have_routed { LLM } else if
+    /// final_text != transcription { bookkeeping }` — against a regression to
+    /// the BROKEN naive three-arm shape: `if verbatim_app.is_some() {} else
+    /// if would_have_routed {…} else if final_text != transcription {…}`.
+    ///
+    /// The two tests above (`verbatim_app_suppresses_llm_even_with_dedicated_force_binding`
+    /// and its companion) both pass against the naive shape too, because in
+    /// both of them `final_text == transcription` going in — Chinese-variant
+    /// conversion never ran (default `selected_language` is `"auto"`), so
+    /// there's nothing for the naive shape's separate `is_some() {}` arm to
+    /// wrongly swallow. The naive shape's bug only manifests when
+    /// `final_text != transcription` for a verbatim app: its mutually
+    /// exclusive `if`/`else if` arms mean the leading `if verbatim_app.is_some()
+    /// {}` (a no-op arm) executes and control never reaches the `else if
+    /// final_text != transcription` bookkeeping arm, so a real, non-LLM text
+    /// change (Chinese-variant conversion) is silently DROPPED —
+    /// `post_processed_text` stays `None` even though the pasted/history text
+    /// differs from the raw transcript.
+    ///
+    /// This test sets `selected_language = "zh-Hant"` (Traditional Chinese),
+    /// which per `maybe_convert_chinese_variant` applies OpenCC's `S2tw`
+    /// config (Simplified -> Traditional). The input
+    /// "国家计算机软件" is Simplified Chinese; independently verified via a
+    /// throwaway probe against this exact `ferrous-opencc` version that
+    /// `S2tw` converts it to "國家計算機軟件" (a real, deterministic,
+    /// non-empty change — no model or network involved, matching this
+    /// function's doc comment). A verbatim-app match (foreground app
+    /// "powershell", on the default `h2_verbatim_apps` list) is also in play,
+    /// so the ONLY way `post_processed_text` can be populated here is via the
+    /// `else if final_text != transcription` bookkeeping arm — exactly the
+    /// arm the naive shape drops.
+    #[tokio::test]
+    async fn verbatim_app_still_records_a_real_non_llm_text_change() {
+        let mut settings = get_default_settings();
+        settings.h2_enabled = true;
+        settings.h2_routes = crate::settings::default_h2_routes();
+        settings.selected_language = "zh-Hant".to_string();
+        // h2_verbatim_apps is left at its default (includes "powershell").
+        assert!(
+            crate::handy2::app_context::is_verbatim_app("powershell", &settings.h2_verbatim_apps),
+            "test premise: 'powershell' must be in the default verbatim list"
+        );
+
+        let transcription = "国家计算机软件"; // Simplified Chinese
+        let expected_converted = "國家計算機軟件"; // Traditional, via OpenCC S2tw
+        assert_ne!(
+            transcription, expected_converted,
+            "test premise: the OpenCC conversion must actually change the text"
+        );
+
+        let result = super::process_transcription_output_with_settings(
+            &settings,
+            transcription,
+            true, // dedicated force-post-process binding: would normally ALWAYS route
+            Some("powershell".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            result.llm_ms, None,
+            "no LLM call should have been attempted — verbatim app suppresses routing"
+        );
+        assert_eq!(
+            result.final_text, expected_converted,
+            "the Chinese-variant conversion must still apply even for a verbatim app \
+             (it's deterministic local text normalization, not an LLM rewrite)"
+        );
+        assert_eq!(
+            result.post_processed_text,
+            Some(expected_converted.to_string()),
+            "the conversion result must be preserved in post_processed_text via the \
+             `else if final_text != transcription` bookkeeping arm — this is exactly what \
+             the naive fallthrough-drop regression would silently swallow"
+        );
+    }
 }
